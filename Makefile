@@ -17,15 +17,22 @@ LIB_M := h3_metal.m h3_gpu.m h3_tokenizer.m
 LIB_OBJ := $(LIB_C:.c=.o) $(LIB_M:.m=.o)
 CLI_OBJ := main.o h3_cli.o linenoise.o
 
-.PHONY: all test parity real-parity clean
+.PHONY: all test parity real-parity clean help ui web pack smoke \
+	dylib api api-release frontend ffmpeg
 
-all: h3 libh3.a
+all: h3 libh3.a libh3.dylib
 
 h3: $(CLI_OBJ) $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 libh3.a: $(LIB_OBJ)
 	$(AR) rcs $@ $^
+
+# Shared library for Rust FFI (h3-sys / h3-api).
+libh3.dylib: $(LIB_OBJ)
+	$(CC) -dynamiclib -o $@ $^ $(LDLIBS) \
+		-install_name @rpath/libh3.dylib \
+		-compatibility_version 1.0.0 -current_version 1.0.0
 
 h3_tests: tests/test_h3.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
@@ -212,4 +219,79 @@ clean:
 		h3_real_dit_schedule_test h3_real_dit_test h3_semantic_dit_test \
 		h3_real_video_vae_test h3_semantic_vae_test \
 	h3_dit_bench h3_dit_bench_864 \
-	libh3.a *.o *.d tests/*.o tests/*.d
+	libh3.a libh3.dylib *.o *.d tests/*.o tests/*.d
+
+# --- Desktop UI ---
+#   make ui     Tauri desktop (API + Vite)
+#   make web    Browser only (API :7810 + UI :5810)
+#   make pack   macOS .app / .dmg
+#   make smoke  API smoke test
+#   make ffmpeg Download static FFmpeg/FFprobe into vendor/
+
+FFMPEG_PLATFORM := $(shell uname -s | tr '[:upper:]' '[:lower:]' | sed 's/darwin/macos/')-$(shell uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/')
+FFMPEG_VENDOR := vendor/ffmpeg/$(FFMPEG_PLATFORM)
+
+help:
+	@echo "Engine:  make / make test"
+	@echo "UI:      make ui | make web | make pack | make smoke"
+	@echo "Deps:    make ffmpeg   # static FFmpeg + FFprobe → $(FFMPEG_VENDOR)"
+
+dylib: libh3.dylib
+
+ffmpeg:
+	bash scripts/fetch-ffmpeg.sh
+
+api: libh3.dylib
+	cd crates && cargo build -p h3-api
+	cp -f libh3.dylib crates/target/debug/libh3.dylib
+	mkdir -p desktop/src-tauri/resources
+	cp -f crates/target/debug/h3-api desktop/src-tauri/resources/h3-api
+	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+	@# Keep Tauri debug resource dir in sync (otherwise `tauri dev` keeps a stale sidecar).
+	@if [ -d desktop/src-tauri/target/debug/resources ]; then \
+		cp -f crates/target/debug/h3-api desktop/src-tauri/target/debug/resources/h3-api; \
+		cp -f libh3.dylib desktop/src-tauri/target/debug/resources/libh3.dylib; \
+	fi
+
+api-release: libh3.dylib
+	cd crates && cargo build -p h3-api --release
+	cp -f libh3.dylib crates/target/release/libh3.dylib
+	mkdir -p desktop/src-tauri/resources
+	cp -f crates/target/release/h3-api desktop/src-tauri/resources/h3-api
+	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+
+frontend:
+	cd frontend && npm install && npm run build
+
+ui: ffmpeg api
+	@# Free :7810 if a stale API is holding it (Vite proxies /api → 7810).
+	@-lsof -tiTCP:7810 -sTCP:LISTEN | xargs kill 2>/dev/null || true
+	cd desktop && npm install && npm run tauri dev
+
+web: ffmpeg api
+	@-lsof -tiTCP:7810 -sTCP:LISTEN | xargs kill 2>/dev/null || true
+	@set -e; \
+	export H3_FFMPEG_DIR="$(CURDIR)/$(FFMPEG_VENDOR)"; \
+	(cd crates && DYLD_FALLBACK_LIBRARY_PATH="$(CURDIR)" cargo run -p h3-api -- --host 127.0.0.1 --port 7810) & \
+	API_PID=$$!; \
+	trap 'kill $$API_PID 2>/dev/null' EXIT INT TERM; \
+	cd frontend && npm install && npm run dev
+
+pack: ffmpeg api-release frontend
+	mkdir -p desktop/src-tauri/resources
+	cp -f crates/target/release/h3-api desktop/src-tauri/resources/h3-api
+	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+	cp -f "$(FFMPEG_VENDOR)/ffmpeg" desktop/src-tauri/resources/ffmpeg
+	cp -f "$(FFMPEG_VENDOR)/ffprobe" desktop/src-tauri/resources/ffprobe
+	chmod +x desktop/src-tauri/resources/ffmpeg desktop/src-tauri/resources/ffprobe
+	cd desktop && npm install && npm run tauri build
+
+smoke: ffmpeg api
+	bash scripts/smoke-api.sh
+
+# Back-compat aliases
+dev: ui
+dev-desktop: ui
+dev-api: web
+pack-macos-desktop: pack
+smoke-api: smoke

@@ -1,0 +1,88 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  H3_FFMPEG_VERSION: release
+
+jobs:
+  macos:
+    name: Build H3.UI (macOS)
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout h3.c.ui
+        uses: actions/checkout@v4
+
+      - name: Checkout dq-ui (sibling)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/danmo-ai/dq-ui.git "$GITHUB_WORKSPACE/../dq-ui"
+          test -d "$GITHUB_WORKSPACE/../dq-ui/packages/ui"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/target
+            desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('crates/Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Build dq-ui packages
+        working-directory: ${{ github.workspace }}/../dq-ui
+        run: |
+          npm install
+          npm run build
+          test -f packages/ui/dist/index.js
+          test -f packages/shell/dist/index.js
+
+      - name: Pack macOS app
+        run: make pack
+
+      - name: List bundle outputs
+        run: |
+          find desktop/src-tauri/target/release/bundle -maxdepth 3 -type f -o -type d -name '*.app' | sort
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: H3.UI-macos
+          path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+            desktop/src-tauri/target/release/bundle/macos/*.app
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          fail_on_unmatched_files: true

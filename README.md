@@ -5,6 +5,8 @@ sequence of working vertical slices: deterministic host/model metadata first,
 then portable Metal block parity, prompt encoding, prompt-to-video/audio, and
 first/last-frame conditioning and then ordered references.
 
+**Mac desktop UI `h3.c.ui`** (dq-ui + Tauri + Rust `h3-api` over `libh3.dylib` FFI; icon rail + card canvas + composer drawer): see [UI.md](UI.md). `make ui` to run.
+
 Prompt-to-video/audio, first/last-frame conditioning, and ordered Ref2VA
 image/video/audio references work end to end. The current work is incremental
 H3-specific Metal performance and memory optimization on M3 Max and M5 Max.

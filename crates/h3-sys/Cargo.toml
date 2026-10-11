@@ -1,0 +1,10 @@
+[package]
+name = "h3-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FFI bindings to libh3 (MiniMax-H3 Metal engine)"
+links = "h3"
+
+[build-dependencies]
+bindgen = "0.71"

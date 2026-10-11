@@ -27,4 +27,19 @@ h3_semantic_dit_test
 h3_real_video_vae_test
 h3_semantic_vae_test
 libh3.a
+libh3.dylib
 .DS_Store
+
+# Desktop UI
+crates/target/
+desktop/node_modules/
+desktop/src-tauri/target/
+frontend/node_modules/
+out/
+.h3-ui/
+*.mp4
+desktop/src-tauri/resources/h3-api
+desktop/src-tauri/resources/libh3.dylib
+desktop/src-tauri/resources/ffmpeg
+desktop/src-tauri/resources/ffprobe
+vendor/ffmpeg/

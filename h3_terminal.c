@@ -202,13 +202,15 @@ static int encode_png(const uint8_t *pixels, size_t size,
     close(output);
     char dimensions[64];
     snprintf(dimensions, sizeof(dimensions), "%dx%d", width, height);
+    const char *ffmpeg_bin = getenv("H3_FFMPEG");
+    if (!ffmpeg_bin || !*ffmpeg_bin) ffmpeg_bin = "ffmpeg";
     char *arguments[] = {
-        "ffmpeg", "-v", "error", "-y", "-f", "rawvideo",
+        (char *)ffmpeg_bin, "-v", "error", "-y", "-f", "rawvideo",
         "-pixel_format", "rgb24", "-video_size", dimensions,
         "-i", raw_path, "-frames:v", "1", path, NULL
     };
     pid_t child = 0;
-    int spawn_error = posix_spawnp(&child, "ffmpeg", NULL, NULL,
+    int spawn_error = posix_spawnp(&child, ffmpeg_bin, NULL, NULL,
                                    arguments, environ);
     int status = 0;
     pid_t waited = -1;

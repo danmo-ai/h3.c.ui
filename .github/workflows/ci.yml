@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  H3_FFMPEG_VERSION: release
+
+jobs:
+  build:
+    name: Build macOS pack
+    runs-on: macos-14
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout h3.c.ui
+        uses: actions/checkout@v4
+
+      - name: Checkout dq-ui (sibling)
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/danmo-ai/dq-ui.git "$GITHUB_WORKSPACE/../dq-ui"
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            desktop/package-lock.json
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/target
+            desktop/src-tauri/target
+          key: ${{ runner.os }}-cargo-ci-${{ hashFiles('crates/Cargo.lock', 'desktop/src-tauri/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-ci-
+            ${{ runner.os }}-cargo-
+
+      - name: Build dq-ui packages
+        working-directory: ${{ github.workspace }}/../dq-ui
+        run: |
+          npm install
+          npm run build
+
+      - name: Pack macOS app
+        run: make pack
+
+      - name: Upload CI artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: H3.UI-macos-ci
+          path: |
+            desktop/src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+          retention-days: 7

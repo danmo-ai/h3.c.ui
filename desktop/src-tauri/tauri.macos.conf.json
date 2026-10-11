@@ -1,0 +1,14 @@
+{
+  "app": {
+    "windows": [
+      {
+        "transparent": true,
+        "titleBarStyle": "Visible",
+        "hiddenTitle": false
+      }
+    ]
+  },
+  "bundle": {
+    "targets": ["app", "dmg"]
+  }
+}
