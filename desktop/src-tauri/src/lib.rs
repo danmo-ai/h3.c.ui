@@ -202,6 +202,23 @@ fn spawn_api(app: &AppHandle, port: u16) -> Result<(), String> {
     cmd.env("DYLD_LIBRARY_PATH", &joined);
     cmd.env("DYLD_FALLBACK_LIBRARY_PATH", &joined);
 
+    // Metal shader source (libh3 looks for relative h3_shaders.metal / H3_SHADERS).
+    let shader_candidates = {
+        let mut v = vec![root.join("h3_shaders.metal")];
+        if let Ok(res) = app.path().resource_dir() {
+            v.push(res.join("h3_shaders.metal"));
+            v.push(res.join("resources").join("h3_shaders.metal"));
+        }
+        v.push(root.join("desktop/src-tauri/resources/h3_shaders.metal"));
+        v
+    };
+    if let Some(shaders) = shader_candidates.into_iter().find(|p| p.is_file()) {
+        cmd.env("H3_SHADERS", &shaders);
+        if let Some(dir) = shaders.parent() {
+            cmd.current_dir(dir);
+        }
+    }
+
     // Prefer bundled static FFmpeg/FFprobe (libh3 reads H3_FFMPEG / H3_FFPROBE).
     let mut path_prefix = Vec::new();
     if let Some(ffmpeg) = find_media_tool(app, "ffmpeg") {

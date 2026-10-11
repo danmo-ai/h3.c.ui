@@ -33,6 +33,34 @@ pub enum DownloadStatus {
     Cancelled,
 }
 
+/// Which weight tree to fetch. FL2VA covers text / first-last; Ref2VA is additive.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DownloadPackage {
+    Fl2va,
+    Ref2va,
+    All,
+}
+
+impl DownloadPackage {
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "fl2va" | "base" | "t2v" => Some(Self::Fl2va),
+            "ref2va" | "ref" => Some(Self::Ref2va),
+            "all" | "full" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fl2va => "fl2va",
+            Self::Ref2va => "ref2va",
+            Self::All => "all",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DownloadProgress {
     pub task_id: String,
@@ -48,6 +76,7 @@ pub struct DownloadProgress {
     pub error: Option<String>,
     pub source: String,
     pub repo: String,
+    pub package: String,
 }
 
 pub struct DownloadManager {
@@ -108,6 +137,7 @@ impl DownloadManager {
         source: DownloadSource,
         repo: String,
         dest: PathBuf,
+        package: DownloadPackage,
     ) -> Result<(String, Arc<Mutex<DownloadProgress>>, Arc<AtomicBool>), String> {
         let mut guard = self.current.lock();
         if let Some(a) = guard.as_ref() {
@@ -132,6 +162,7 @@ impl DownloadManager {
             error: None,
             source: source.as_str().into(),
             repo: repo.clone(),
+            package: package.as_str().into(),
         }));
         *guard = Some(ActiveDownload {
             task_id: task_id.clone(),
@@ -144,7 +175,7 @@ impl DownloadManager {
         std::thread::Builder::new()
             .name("h3-download".into())
             .spawn(move || {
-                run_download(source, &repo, &dest, progress_bg, cancel_bg);
+                run_download(source, &repo, &dest, package, progress_bg, cancel_bg);
             })
             .map_err(|e| e.to_string())?;
 
@@ -167,13 +198,18 @@ fn run_download(
     source: DownloadSource,
     repo: &str,
     dest: &Path,
+    package: DownloadPackage,
     progress: Arc<Mutex<DownloadProgress>>,
     cancel: Arc<AtomicBool>,
 ) {
     {
         let mut p = progress.lock();
         p.status = DownloadStatus::Running;
-        p.message = format!("listing · {} · {repo}", source.as_str());
+        p.message = format!(
+            "listing · {} · {repo} · {}",
+            source.as_str(),
+            package.as_str()
+        );
     }
 
     if let Err(e) = std::fs::create_dir_all(dest) {
@@ -190,7 +226,7 @@ fn run_download(
     };
 
     let files = match list_files(&client, source, repo) {
-        Ok(f) => f,
+        Ok(f) => filter_package_files(f, package),
         Err(e) => {
             fail(&progress, e, "list files");
             return;
@@ -199,7 +235,10 @@ fn run_download(
     if files.is_empty() {
         fail(
             &progress,
-            "remote returned an empty file list".into(),
+            format!(
+                "no remote files matched package `{}` (FL2VA/ or Ref2VA/)",
+                package.as_str()
+            ),
             "list files",
         );
         return;
@@ -291,6 +330,32 @@ fn fail(progress: &Arc<Mutex<DownloadProgress>>, error: String, message: &str) {
     p.status = DownloadStatus::Failed;
     p.error = Some(error);
     p.message = message.into();
+}
+
+fn is_repo_meta(path: &str) -> bool {
+    matches!(
+        path,
+        "LICENSE" | "README.md" | "README" | ".gitattributes" | "model_index.json"
+    ) || (!path.contains('/')
+        && (path.ends_with(".md") || path.ends_with(".txt") || path.ends_with(".json")))
+}
+
+fn filter_package_files(files: Vec<RemoteFile>, package: DownloadPackage) -> Vec<RemoteFile> {
+    files
+        .into_iter()
+        .filter(|f| {
+            let p = f.path.as_str();
+            match package {
+                DownloadPackage::All => true,
+                DownloadPackage::Fl2va => {
+                    p.starts_with("FL2VA/") || p.starts_with("fl2va/") || is_repo_meta(p)
+                }
+                DownloadPackage::Ref2va => {
+                    p.starts_with("Ref2VA/") || p.starts_with("ref2va/") || is_repo_meta(p)
+                }
+            }
+        })
+        .collect()
 }
 
 fn list_files(

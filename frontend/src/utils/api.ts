@@ -1,4 +1,5 @@
 export type DownloadSourceId = 'huggingface' | 'hf_mirror' | 'modelscope';
+export type DownloadPackageId = 'fl2va' | 'ref2va' | 'all';
 
 export type ModelStatus = {
   model_dir: string;
@@ -73,6 +74,14 @@ export type TaskSnapshot = {
     output_path?: string | null;
   } | null;
   error?: string | null;
+  prompt?: string;
+  output_name?: string | null;
+  width?: number;
+  height?: number;
+  frames?: number | null;
+  seconds?: number | null;
+  created_ms?: number;
+  finished_ms?: number | null;
 };
 
 export type DownloadProgress = {
@@ -89,6 +98,7 @@ export type DownloadProgress = {
   error?: string | null;
   source?: string;
   repo?: string;
+  package?: string;
 };
 
 async function json<T>(path: string, init?: RequestInit): Promise<T> {
@@ -106,6 +116,26 @@ async function json<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+/** Wait until h3-api answers (Tauri sidecar often boots after Vite). */
+export async function waitForApi(opts?: {
+  timeoutMs?: number;
+  intervalMs?: number;
+}): Promise<boolean> {
+  const timeoutMs = opts?.timeoutMs ?? 60_000;
+  const intervalMs = opts?.intervalMs ?? 250;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    try {
+      const res = await fetch('/api/system/health', { method: 'GET' });
+      if (res.ok) return true;
+    } catch {
+      /* ECONNREFUSED while sidecar starts */
+    }
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+  return false;
+}
+
 export const api = {
   health: () => json<{ ok: boolean; engine_version: string }>('/api/system/health'),
   ffmpeg: () =>
@@ -118,11 +148,14 @@ export const api = {
     }>('/api/system/ffmpeg'),
   modelStatus: () => json<ModelStatus>('/api/model/status'),
   modelLoad: () => json<{ ok: boolean }>('/api/model/load', { method: 'POST' }),
-  startDownload: (source?: DownloadSourceId) =>
-    json<{ task_id: string; source: string; repo: string }>('/api/model/download', {
-      method: 'POST',
-      body: JSON.stringify({ source }),
-    }),
+  startDownload: (source?: DownloadSourceId, packageId: DownloadPackageId = 'fl2va') =>
+    json<{ task_id: string; source: string; repo: string; package: string }>(
+      '/api/model/download',
+      {
+        method: 'POST',
+        body: JSON.stringify({ source, package: packageId }),
+      },
+    ),
   downloadCurrent: () => json<DownloadProgress>('/api/model/download/current'),
   cancelDownload: (taskId: string) =>
     json<{ ok: boolean }>(`/api/model/download/${taskId}/cancel`, { method: 'POST' }),
@@ -136,6 +169,7 @@ export const api = {
   cancelTask: (taskId: string) =>
     json<{ ok: boolean }>(`/api/tasks/${taskId}/cancel`, { method: 'POST' }),
   getTask: (taskId: string) => json<TaskSnapshot>(`/api/tasks/${taskId}`),
+  listFailedTasks: () => json<{ tasks: TaskSnapshot[] }>('/api/tasks/failed'),
   listOutputs: () =>
     json<{ outputs: Array<{ name: string; path: string; bytes: number; modified?: number }> }>(
       '/api/outputs',

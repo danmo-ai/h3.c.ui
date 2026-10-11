@@ -352,11 +352,46 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
         }
         const char *source_path = shader_source_path ? shader_source_path :
                                                        "h3_shaders.metal";
-        NSString *path = [NSString stringWithUTF8String:source_path];
+        const char *env_shaders = getenv("H3_SHADERS");
+        NSFileManager *fm = NSFileManager.defaultManager;
+        NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+        if (source_path && source_path[0])
+            [candidates addObject:[NSString stringWithUTF8String:source_path]];
+        if (env_shaders && env_shaders[0])
+            [candidates addObject:[NSString stringWithUTF8String:env_shaders]];
+        /* Bundled desktop / API may not start with CWD = repo root. */
+        NSString *exe = [NSProcessInfo.processInfo.arguments.firstObject
+            stringByStandardizingPath];
+        if (exe.length) {
+            NSString *dir = exe.stringByDeletingLastPathComponent;
+            [candidates addObject:
+                [dir stringByAppendingPathComponent:@"h3_shaders.metal"]];
+            [candidates addObject:
+                [[dir stringByDeletingLastPathComponent]
+                    stringByAppendingPathComponent:@"h3_shaders.metal"]];
+        }
+        NSString *cwdMetal =
+            [fm.currentDirectoryPath
+                stringByAppendingPathComponent:@"h3_shaders.metal"];
+        [candidates addObject:cwdMetal];
+
         NSError *libraryError = nil;
-        NSString *source = [NSString stringWithContentsOfFile:path
-                                                     encoding:NSUTF8StringEncoding
-                                                        error:&libraryError];
+        NSString *source = nil;
+        for (NSString *candidate in candidates) {
+            if (![fm isReadableFileAtPath:candidate]) continue;
+            NSError *readError = nil;
+            NSString *text =
+                [NSString stringWithContentsOfFile:candidate
+                                          encoding:NSUTF8StringEncoding
+                                             error:&readError];
+            if (text.length) {
+                source = text;
+                source_path = candidate.fileSystemRepresentation;
+                libraryError = nil;
+                break;
+            }
+            libraryError = readError;
+        }
         if (source) {
             MTLCompileOptions *options = [[MTLCompileOptions alloc] init];
             options.mathMode = MTLMathModeSafe;

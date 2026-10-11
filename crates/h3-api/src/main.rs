@@ -45,6 +45,7 @@ async fn main() -> anyhow::Result<()> {
         config.model_dir.clone(),
         config.output_dir.clone(),
         config.cache_enabled,
+        home.join("task_history.json"),
     );
     let state = AppState {
         home: home.clone(),

@@ -11,11 +11,14 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt as _;
 
 use crate::config::DownloadSource;
+use crate::download::DownloadPackage;
 use crate::state::AppState;
 
 #[derive(Debug, Default, Deserialize)]
 pub struct StartDownloadBody {
     pub source: Option<String>,
+    /// `fl2va` (text / first-last) · `ref2va` (references) · `all`
+    pub package: Option<String>,
 }
 
 pub async fn start(
@@ -28,6 +31,11 @@ pub async fn start(
         .as_deref()
         .and_then(DownloadSource::parse)
         .unwrap_or(cfg.download_source);
+    let package = body
+        .package
+        .as_deref()
+        .and_then(DownloadPackage::parse)
+        .unwrap_or(DownloadPackage::Fl2va);
 
     cfg.download_source = source;
     let repo = cfg.repo_for_source(source).to_string();
@@ -37,12 +45,13 @@ pub async fn start(
 
     let (task_id, _, _) = state
         .downloads
-        .start(source, repo.clone(), cfg.model_dir.clone())
+        .start(source, repo.clone(), cfg.model_dir.clone(), package)
         .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
     Ok(Json(json!({
         "task_id": task_id,
         "source": source.as_str(),
         "repo": repo,
+        "package": package.as_str(),
     })))
 }
 

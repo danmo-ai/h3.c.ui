@@ -2,12 +2,12 @@
 import { computed, onMounted, ref } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useI18n } from 'vue-i18n';
-import { api, type DownloadSourceId, type ModelStatus } from '@/utils/api';
+import { api, type DownloadPackageId, type DownloadSourceId, type ModelStatus } from '@/utils/api';
 import { useDownloadStore } from '@/stores/download';
 
 const { t } = useI18n();
 const download = useDownloadStore();
-const { progress, busy, source } = storeToRefs(download);
+const { progress, busy, source, activePackage } = storeToRefs(download);
 const status = ref<ModelStatus | null>(null);
 
 const sourceOptions = computed(() => [
@@ -33,19 +33,13 @@ const sourceHint = computed(() => {
   }
 });
 
-const readyLabel = computed(() => {
-  if (!status.value) return '…';
-  if (status.value.fl2va_ready && status.value.ref2va_ready) return t('download.readyAll');
-  if (status.value.fl2va_ready) return t('download.readyFl2va');
-  return t('download.notReady');
-});
-
 const progressPct = computed(() => Math.round(progress.value?.progress || 0));
 
 const progressLine = computed(() => {
   const p = progress.value;
   if (!p) return '';
   const parts: string[] = [];
+  if (p.package) parts.push(p.package);
   if (p.files_total) parts.push(`${p.files_done ?? 0}/${p.files_total}`);
   if (p.current_file) parts.push(p.current_file);
   else if (p.message) parts.push(p.message);
@@ -74,15 +68,14 @@ async function refresh() {
   }
 }
 
-async function start() {
-  await download.start();
+async function start(pkg: DownloadPackageId) {
+  await download.start(pkg);
   void refresh();
 }
 
 onMounted(async () => {
   await refresh();
   await download.restore();
-  // After restore, model dir size may have grown.
   if (download.busy) void refresh();
 });
 </script>
@@ -104,27 +97,72 @@ onMounted(async () => {
         @update:model-value="(v: string) => download.setSource(v as DownloadSourceId)"
       />
       <p class="h3-muted">{{ sourceHint }}</p>
+      <p class="h3-muted">{{ activeRepo }} · {{ fmtBytes(status?.disk_bytes || 0) }}</p>
     </section>
 
-    <div class="h3-download__hero">
-      <div class="h3-download__title-row">
-        <div class="h3-download__repo">{{ activeRepo }}</div>
-        <span
-          class="h3-download__status"
-          :data-state="status?.fl2va_ready ? (status.ref2va_ready ? 'all' : 'partial') : 'missing'"
+    <section class="h3-download__packages">
+      <div class="h3-download__section-label">{{ t('download.packages') }}</div>
+
+      <div class="h3-download__pkg" data-state="fl2va">
+        <div class="h3-download__pkg-head">
+          <div>
+            <div class="h3-download__pkg-title">{{ t('download.pkgFl2va') }}</div>
+            <p class="h3-muted">{{ t('download.pkgFl2vaHint') }}</p>
+          </div>
+          <span class="h3-download__pill" :data-ready="status?.fl2va_ready ? '1' : '0'">
+            {{ status?.fl2va_ready ? t('download.ready') : t('download.notReady') }}
+          </span>
+        </div>
+        <DqButton
+          size="sm"
+          type="primary"
+          :disabled="busy"
+          @click="start('fl2va')"
         >
-          {{ readyLabel }}
-        </span>
+          {{
+            busy && activePackage === 'fl2va'
+              ? t('download.downloading')
+              : status?.fl2va_ready
+                ? t('download.resumeOrRepair')
+                : t('download.startFl2va')
+          }}
+        </DqButton>
       </div>
-      <p class="h3-download__meta">
-        {{ fmtBytes(status?.disk_bytes || 0) }}
-        <span v-if="status?.model_dir"> · {{ status.model_dir }}</span>
-      </p>
-    </div>
+
+      <div class="h3-download__pkg" data-state="ref2va">
+        <div class="h3-download__pkg-head">
+          <div>
+            <div class="h3-download__pkg-title">{{ t('download.pkgRef2va') }}</div>
+            <p class="h3-muted">{{ t('download.pkgRef2vaHint') }}</p>
+          </div>
+          <span class="h3-download__pill" :data-ready="status?.ref2va_ready ? '1' : '0'">
+            {{ status?.ref2va_ready ? t('download.ready') : t('download.notReady') }}
+          </span>
+        </div>
+        <DqButton
+          size="sm"
+          type="primary"
+          :disabled="busy || !status?.fl2va_ready"
+          @click="start('ref2va')"
+        >
+          {{
+            busy && activePackage === 'ref2va'
+              ? t('download.downloading')
+              : status?.ref2va_ready
+                ? t('download.resumeOrRepair')
+                : t('download.startRef2va')
+          }}
+        </DqButton>
+        <p v-if="!status?.fl2va_ready" class="h3-muted">{{ t('download.needFl2vaFirst') }}</p>
+      </div>
+    </section>
 
     <div v-if="busy && progress" class="h3-download__progress">
       <DqProgress :percentage="progressPct" />
       <p class="h3-muted">{{ progressLine || '…' }}</p>
+      <DqButton size="sm" variant="ghost" @click="download.cancel()">
+        {{ t('download.cancel') }}
+      </DqButton>
     </div>
     <div
       v-else-if="progress && (progress.status === 'failed' || progress.status === 'cancelled')"
@@ -134,12 +172,6 @@ onMounted(async () => {
     </div>
 
     <div class="h3-download__actions">
-      <DqButton size="sm" type="primary" :disabled="busy" @click="start">
-        {{ t('download.start') }}
-      </DqButton>
-      <DqButton size="sm" variant="ghost" :disabled="!busy" @click="download.cancel()">
-        {{ t('download.cancel') }}
-      </DqButton>
       <DqButton size="sm" variant="ghost" :disabled="busy" @click="refresh">
         {{ t('download.refresh') }}
       </DqButton>
@@ -173,7 +205,8 @@ onMounted(async () => {
   margin: 6px 0 0;
 }
 
-.h3-download__source {
+.h3-download__source,
+.h3-download__packages {
   display: flex;
   flex-direction: column;
   gap: 10px;
@@ -187,53 +220,46 @@ onMounted(async () => {
   opacity: 0.55;
 }
 
-.h3-download__source .h3-muted {
+.h3-download__source .h3-muted,
+.h3-download__packages .h3-muted {
   margin: 0;
   font-size: var(--dq-font-size-caption, 12px);
 }
 
-.h3-download__hero {
+.h3-download__pkg {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 10px;
+  padding: 14px 0;
+  border-top: 0.5px solid color-mix(in srgb, var(--dq-label-primary, #fff) 10%, transparent);
 }
 
-.h3-download__title-row {
+.h3-download__pkg:first-of-type {
+  border-top: none;
+  padding-top: 0;
+}
+
+.h3-download__pkg-head {
   display: flex;
-  flex-wrap: wrap;
-  align-items: baseline;
-  gap: 12px 16px;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
 }
 
-.h3-download__repo {
+.h3-download__pkg-title {
   font-weight: 600;
-  letter-spacing: 0.01em;
+  margin-bottom: 4px;
 }
 
-.h3-download__status {
+.h3-download__pill {
+  flex-shrink: 0;
   font-size: var(--dq-font-size-caption, 12px);
   font-weight: 550;
-  opacity: 0.85;
+  opacity: 0.8;
 }
 
-.h3-download__status[data-state='all'] {
+.h3-download__pill[data-ready='1'] {
   color: var(--dq-success, #30d158);
-}
-
-.h3-download__status[data-state='partial'] {
-  color: var(--dq-warning, #ffd60a);
-}
-
-.h3-download__status[data-state='missing'] {
-  color: var(--dq-label-secondary, inherit);
-  opacity: 0.7;
-}
-
-.h3-download__meta {
-  margin: 0;
-  font-size: var(--dq-font-size-caption, 12px);
-  opacity: 0.55;
-  word-break: break-all;
 }
 
 .h3-download__progress {

@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "H3.UI",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "identifier": "com.danmo.h3.desktop",
   "build": {
     "beforeDevCommand": "cd ../frontend && npm run dev",
@@ -41,6 +41,7 @@
     "resources": [
       "resources/h3-api",
       "resources/libh3.dylib",
+      "resources/h3_shaders.metal",
       "resources/ffmpeg",
       "resources/ffprobe"
     ]

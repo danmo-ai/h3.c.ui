@@ -40,6 +40,7 @@ out/
 *.mp4
 desktop/src-tauri/resources/h3-api
 desktop/src-tauri/resources/libh3.dylib
+desktop/src-tauri/resources/h3_shaders.metal
 desktop/src-tauri/resources/ffmpeg
 desktop/src-tauri/resources/ffprobe
 vendor/ffmpeg/

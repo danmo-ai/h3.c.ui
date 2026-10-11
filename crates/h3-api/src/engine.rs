@@ -286,7 +286,7 @@ fn default_ref_image_size() -> String {
     "match".into()
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
 pub struct GenerateResult {
     pub width: i32,
     pub height: i32,

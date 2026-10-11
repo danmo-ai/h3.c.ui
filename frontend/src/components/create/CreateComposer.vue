@@ -32,6 +32,7 @@ const props = defineProps<{
 
 const emit = defineEmits<{
   generated: [];
+  failed: [];
   'update:busy': [boolean];
 }>();
 
@@ -236,6 +237,7 @@ async function generate() {
         closeEs();
       } else if (data.status === 'failed') {
         toast.error(data.error || 'Generation failed');
+        emit('failed');
         closeEs();
       } else if (data.status === 'cancelled') {
         toast.notify({ title: 'Cancelled', message: '', type: 'warning' });

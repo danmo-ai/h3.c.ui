@@ -1,13 +1,16 @@
 import { defineConfig } from 'vite';
 import vue from '@vitejs/plugin-vue';
-import { resolve } from 'path';
+import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const rootDir = import.meta.dirname ?? fileURLToPath(new URL('.', import.meta.url));
 
 export default defineConfig({
   plugins: [vue()],
   resolve: {
     alias: {
-      '@': resolve(__dirname, 'src'),
-      vue: resolve(__dirname, 'node_modules/vue'),
+      '@': resolve(rootDir, 'src'),
+      vue: resolve(rootDir, 'node_modules/vue'),
     },
     dedupe: ['vue'],
   },
@@ -27,7 +30,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: resolve(__dirname, '../out/frontend/dist'),
+    outDir: resolve(rootDir, '../out/frontend/dist'),
     emptyOutDir: true,
     sourcemap: true,
   },

@@ -4,16 +4,16 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use parking_lot::{Condvar, Mutex};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use crate::engine::{Engine, GenerateRequest, GenerateResult, ProgressEvent};
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Queued,
@@ -23,7 +23,7 @@ pub enum TaskStatus {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TaskSnapshot {
     pub task_id: String,
     pub status: TaskStatus,
@@ -31,9 +31,26 @@ pub struct TaskSnapshot {
     pub completed: i32,
     pub total: i32,
     pub progress: f64,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
     pub preview_jpeg_base64: Option<String>,
     pub result: Option<GenerateResult>,
     pub error: Option<String>,
+    #[serde(default)]
+    pub prompt: String,
+    #[serde(default)]
+    pub output_name: Option<String>,
+    #[serde(default)]
+    pub width: i32,
+    #[serde(default)]
+    pub height: i32,
+    #[serde(default)]
+    pub frames: Option<i32>,
+    #[serde(default)]
+    pub seconds: Option<f64>,
+    #[serde(default)]
+    pub created_ms: u64,
+    #[serde(default)]
+    pub finished_ms: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -46,6 +63,7 @@ pub struct TaskManager {
     output_dir: Mutex<PathBuf>,
     model_dir: Mutex<PathBuf>,
     cache_enabled: Mutex<bool>,
+    history_path: PathBuf,
     tasks: Mutex<HashMap<String, TaskInner>>,
     queue: Mutex<Vec<String>>,
     wake: Condvar,
@@ -64,18 +82,84 @@ impl TaskManager {
         model_dir: PathBuf,
         output_dir: PathBuf,
         cache_enabled: bool,
+        history_path: PathBuf,
     ) -> Arc<Self> {
         let mgr = Arc::new(Self {
             engine,
             output_dir: Mutex::new(output_dir),
             model_dir: Mutex::new(model_dir),
             cache_enabled: Mutex::new(cache_enabled),
+            history_path,
             tasks: Mutex::new(HashMap::new()),
             queue: Mutex::new(Vec::new()),
             wake: Condvar::new(),
         });
         mgr.clone().spawn_worker();
         mgr
+    }
+
+    fn now_ms() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0)
+    }
+
+    fn snapshot_from_request(task_id: String, request: &GenerateRequest) -> TaskSnapshot {
+        let prompt = if request.prompt.chars().count() > 160 {
+            let mut s: String = request.prompt.chars().take(160).collect();
+            s.push('…');
+            s
+        } else {
+            request.prompt.clone()
+        };
+        TaskSnapshot {
+            task_id,
+            status: TaskStatus::Queued,
+            phase: "queued".into(),
+            completed: 0,
+            total: 0,
+            progress: 0.0,
+            preview_jpeg_base64: None,
+            result: None,
+            error: None,
+            prompt,
+            output_name: request.output_name.clone(),
+            width: request.width,
+            height: request.height,
+            frames: request.frames,
+            seconds: request.seconds,
+            created_ms: Self::now_ms(),
+            finished_ms: None,
+        }
+    }
+
+    fn persist_terminal(&self, snap: &TaskSnapshot) {
+        if !matches!(
+            snap.status,
+            TaskStatus::Failed | TaskStatus::Completed | TaskStatus::Cancelled
+        ) {
+            return;
+        }
+        let mut entry = snap.clone();
+        entry.preview_jpeg_base64 = None;
+        let mut history = self.load_history();
+        history.retain(|h| h.task_id != entry.task_id);
+        history.insert(0, entry);
+        history.truncate(100);
+        if let Some(parent) = self.history_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&history) {
+            let _ = std::fs::write(&self.history_path, bytes);
+        }
+    }
+
+    fn load_history(&self) -> Vec<TaskSnapshot> {
+        let Ok(bytes) = std::fs::read(&self.history_path) else {
+            return Vec::new();
+        };
+        serde_json::from_slice(&bytes).unwrap_or_default()
     }
 
     pub fn update_paths(&self, model_dir: PathBuf, output_dir: PathBuf, cache_enabled: bool) {
@@ -88,17 +172,7 @@ impl TaskManager {
         let task_id = Uuid::new_v4().to_string();
         let (tx, _) = broadcast::channel(64);
         let cancel = Arc::new(AtomicBool::new(false));
-        let snapshot = TaskSnapshot {
-            task_id: task_id.clone(),
-            status: TaskStatus::Queued,
-            phase: "queued".into(),
-            completed: 0,
-            total: 0,
-            progress: 0.0,
-            preview_jpeg_base64: None,
-            result: None,
-            error: None,
-        };
+        let snapshot = Self::snapshot_from_request(task_id.clone(), &request);
         {
             let mut tasks = self.tasks.lock();
             tasks.insert(
@@ -151,11 +225,46 @@ impl TaskManager {
             .tasks
             .lock()
             .values()
-            .map(|t| t.snapshot.clone())
+            .map(|t| {
+                let mut s = t.snapshot.clone();
+                s.preview_jpeg_base64 = None;
+                s
+            })
             .collect();
-        v.sort_by(|a, b| b.task_id.cmp(&a.task_id));
+        v.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
         v.truncate(50);
         v
+    }
+
+    /// Failed tasks from live memory + persisted history (newest first).
+    pub fn list_failed(&self) -> Vec<TaskSnapshot> {
+        let mut by_id: HashMap<String, TaskSnapshot> = HashMap::new();
+        for h in self.load_history() {
+            if h.status == TaskStatus::Failed {
+                by_id.insert(h.task_id.clone(), h);
+            }
+        }
+        for t in self.tasks.lock().values() {
+            if t.snapshot.status == TaskStatus::Failed {
+                let mut s = t.snapshot.clone();
+                s.preview_jpeg_base64 = None;
+                by_id.insert(s.task_id.clone(), s);
+            }
+        }
+        let mut v: Vec<_> = by_id.into_values().collect();
+        v.sort_by(|a, b| b.created_ms.cmp(&a.created_ms));
+        v.truncate(50);
+        v
+    }
+
+    fn mark_finished(&self, task_id: &str) {
+        let mut tasks = self.tasks.lock();
+        if let Some(t) = tasks.get_mut(task_id) {
+            t.snapshot.finished_ms = Some(Self::now_ms());
+            let snap = t.snapshot.clone();
+            drop(tasks);
+            self.persist_terminal(&snap);
+        }
     }
 
     fn spawn_worker(self: Arc<Self>) {
@@ -210,15 +319,19 @@ impl TaskManager {
             let cache_enabled = *self.cache_enabled.lock();
 
             if let Err(e) = self.engine.ensure_loaded(&model_dir, cache_enabled) {
-                let mut tasks = self.tasks.lock();
-                if let Some(t) = tasks.get_mut(&task_id) {
-                    t.snapshot.status = TaskStatus::Failed;
-                    t.snapshot.error = Some(e.to_string());
-                    t.snapshot.phase = "failed".into();
-                    let _ = t.tx.send(TaskEvent {
-                        snapshot: t.snapshot.clone(),
-                    });
+                {
+                    let mut tasks = self.tasks.lock();
+                    if let Some(t) = tasks.get_mut(&task_id) {
+                        t.snapshot.status = TaskStatus::Failed;
+                        t.snapshot.error = Some(e.to_string());
+                        t.snapshot.phase = "failed".into();
+                        t.snapshot.finished_ms = Some(Self::now_ms());
+                        let _ = t.tx.send(TaskEvent {
+                            snapshot: t.snapshot.clone(),
+                        });
+                    }
                 }
+                self.mark_finished(&task_id);
                 self.queue.lock().retain(|id| id != &task_id);
                 continue;
             }
@@ -293,11 +406,13 @@ impl TaskManager {
                             t.snapshot.phase = "failed".into();
                         }
                     }
+                    t.snapshot.finished_ms = Some(Self::now_ms());
                     let _ = t.tx.send(TaskEvent {
                         snapshot: t.snapshot.clone(),
                     });
                 }
             }
+            self.mark_finished(&task_id);
             self.queue.lock().retain(|id| id != &task_id);
         }
     }

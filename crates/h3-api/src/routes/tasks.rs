@@ -16,6 +16,12 @@ pub async fn list(State(state): State<AppState>) -> Json<Value> {
     Json(serde_json::to_value(state.tasks.list_recent()).unwrap_or_default())
 }
 
+pub async fn list_failed(State(state): State<AppState>) -> Json<Value> {
+    Json(serde_json::json!({
+        "tasks": state.tasks.list_failed(),
+    }))
+}
+
 pub async fn get(
     State(state): State<AppState>,
     Path(task_id): Path<String>,

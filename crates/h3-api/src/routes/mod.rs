@@ -31,6 +31,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/api/generate", post(generate::start))
         .route("/api/tasks", get(tasks::list))
+        .route("/api/tasks/failed", get(tasks::list_failed))
         .route("/api/tasks/{task_id}", get(tasks::get))
         .route("/api/tasks/{task_id}/stream", get(tasks::stream))
         .route("/api/tasks/{task_id}/cancel", post(tasks::cancel))

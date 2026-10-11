@@ -247,10 +247,12 @@ api: libh3.dylib
 	mkdir -p desktop/src-tauri/resources
 	cp -f crates/target/debug/h3-api desktop/src-tauri/resources/h3-api
 	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+	cp -f h3_shaders.metal desktop/src-tauri/resources/h3_shaders.metal
 	@# Keep Tauri debug resource dir in sync (otherwise `tauri dev` keeps a stale sidecar).
 	@if [ -d desktop/src-tauri/target/debug/resources ]; then \
 		cp -f crates/target/debug/h3-api desktop/src-tauri/target/debug/resources/h3-api; \
 		cp -f libh3.dylib desktop/src-tauri/target/debug/resources/libh3.dylib; \
+		cp -f h3_shaders.metal desktop/src-tauri/target/debug/resources/h3_shaders.metal; \
 	fi
 
 api-release: libh3.dylib
@@ -259,6 +261,7 @@ api-release: libh3.dylib
 	mkdir -p desktop/src-tauri/resources
 	cp -f crates/target/release/h3-api desktop/src-tauri/resources/h3-api
 	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+	cp -f h3_shaders.metal desktop/src-tauri/resources/h3_shaders.metal
 
 frontend:
 	cd frontend && npm install && npm run build
@@ -272,7 +275,8 @@ web: ffmpeg api
 	@-lsof -tiTCP:7810 -sTCP:LISTEN | xargs kill 2>/dev/null || true
 	@set -e; \
 	export H3_FFMPEG_DIR="$(CURDIR)/$(FFMPEG_VENDOR)"; \
-	(cd crates && DYLD_FALLBACK_LIBRARY_PATH="$(CURDIR)" cargo run -p h3-api -- --host 127.0.0.1 --port 7810) & \
+	export H3_SHADERS="$(CURDIR)/h3_shaders.metal"; \
+	(cd crates && DYLD_FALLBACK_LIBRARY_PATH="$(CURDIR)" H3_SHADERS="$$H3_SHADERS" cargo run -p h3-api -- --host 127.0.0.1 --port 7810) & \
 	API_PID=$$!; \
 	trap 'kill $$API_PID 2>/dev/null' EXIT INT TERM; \
 	cd frontend && npm install && npm run dev
@@ -281,6 +285,7 @@ pack: ffmpeg api-release frontend
 	mkdir -p desktop/src-tauri/resources
 	cp -f crates/target/release/h3-api desktop/src-tauri/resources/h3-api
 	cp -f libh3.dylib desktop/src-tauri/resources/libh3.dylib
+	cp -f h3_shaders.metal desktop/src-tauri/resources/h3_shaders.metal
 	cp -f "$(FFMPEG_VENDOR)/ffmpeg" desktop/src-tauri/resources/ffmpeg
 	cp -f "$(FFMPEG_VENDOR)/ffprobe" desktop/src-tauri/resources/ffprobe
 	chmod +x desktop/src-tauri/resources/ffmpeg desktop/src-tauri/resources/ffprobe

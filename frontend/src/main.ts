@@ -7,6 +7,7 @@ import { toast } from './utils/feedback';
 import App from './App.vue';
 import { installDanQingUi } from './plugins/dq-ui';
 import { installTauriMacosShell } from './utils/desktop';
+import { waitForApi } from './utils/api';
 import { useThemeStore } from './stores/theme';
 import { useDownloadStore } from './stores/download';
 import '@danqing/dq-tokens/dq-mac.css';
@@ -37,11 +38,6 @@ app.use(i18n);
 const themeStore = useThemeStore();
 themeStore.init();
 
-app.mount('#app');
-
-// Reattach in-flight model download across route changes / reloads.
-void useDownloadStore().restore();
-
 app.config.errorHandler = (err) => {
   console.error(err);
   toast.notify({
@@ -51,3 +47,11 @@ app.config.errorHandler = (err) => {
     duration: 6000,
   });
 };
+
+void (async () => {
+  // Vite is up before the Tauri-spawned h3-api; wait so first /api/* don't 502.
+  await waitForApi();
+  app.mount('#app');
+  // Reattach in-flight model download across route changes / reloads.
+  void useDownloadStore().restore();
+})();
