@@ -16,12 +16,27 @@ env:
 jobs:
   macos:
     name: Build H3.UI (macOS)
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 90
 
     steps:
       - name: Checkout h3.c.ui
         uses: actions/checkout@v4
+
+      - name: Select newest Xcode SDK
+        run: |
+          set -euo pipefail
+          for app in /Applications/Xcode_26.3.app /Applications/Xcode_26.2.app \
+                     /Applications/Xcode_26.1.1.app /Applications/Xcode_26.0.1.app \
+                     /Applications/Xcode_16.4.app /Applications/Xcode.app; do
+            if [[ -d "$app/Contents/Developer" ]]; then
+              sudo xcode-select -s "$app/Contents/Developer"
+              echo "Using $app"
+              break
+            fi
+          done
+          xcodebuild -version
+          xcrun --show-sdk-version
 
       - name: Checkout dq-ui (sibling)
         run: |
