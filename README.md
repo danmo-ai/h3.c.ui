@@ -8,6 +8,8 @@ Language: **English** | [中文](README_zh.md)
 
 **Native MiniMax-H3 video on Apple Silicon** — Metal-first `libh3` engine, macOS desktop app, and a bilingual Create studio. Prompt → video/audio, first/last-frame, and ordered Ref2VA references, without leaving your Mac.
 
+![H3.UI Create studio](docs/screenshots/create.png)
+
 Product name: **H3.UI**. Engine CLI stays `h3`; control plane lives under `~/.h3-ui/`.
 
 | | |
@@ -39,7 +41,7 @@ Same studio pattern as [Danmo Make](https://github.com/danmo-ai/danmo-make): ico
 | **Generate** | Prompt, resolution, frames/seconds, steps, seed, speed & compatibility toggles |
 | **Keyframes** | Upload first (required in FL2VA mode) and optional last frame — real files, not path paste |
 | **Ref2VA** | Ordered references: image / video / audio / video+audio |
-| **Models** | Download MiniMax-H3 into `~/.h3-ui/models/`; status for FL2VA / Ref2VA readiness |
+| **Models** | Download MiniMax-H3 into `~/.h3-ui/models/`; status for FL2VA / Ref2VA / Turbo LoRA readiness |
 | **Gallery** | Local outputs as cards; open / delete |
 | **Engine CLI** | Same repo: `./h3` interactive session, profiles, parity flags — see [ENGINE.md](ENGINE.md) |
 

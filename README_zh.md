@@ -8,6 +8,8 @@ Language: [English](README.md) | **中文**
 
 **在 Apple Silicon 上原生跑 MiniMax-H3** — Metal 优先的 `libh3` 引擎、macOS 桌面端，以及双语创作工作室。文生视频/音频、首末帧、有序 Ref2VA 参考，全程本地完成。
 
+![H3.UI 创作页](docs/screenshots/create.png)
+
 产品名：**H3.UI**。引擎 CLI 仍为 `h3`；控制面目录为 `~/.h3-ui/`。
 
 | | |
@@ -39,7 +41,7 @@ Language: [English](README.md) | **中文**
 | **创作** | 提示词、分辨率、帧数/秒数、步数、种子、速度与兼容开关 |
 | **首末帧** | 上传首帧（FL2VA 必填）与可选末帧 — 真文件上传，不是手填路径 |
 | **Ref2VA** | 有序参考：图像 / 视频 / 音频 / 视频+音频 |
-| **模型** | 下载 MiniMax-H3 到 `~/.h3-ui/models/`；显示 FL2VA / Ref2VA 就绪状态 |
+| **模型** | 下载 MiniMax-H3 到 `~/.h3-ui/models/`；显示 FL2VA / Ref2VA / Turbo LoRA 就绪状态 |
 | **作品** | 本地输出卡片；打开 / 删除 |
 | **引擎 CLI** | 同仓库 `./h3` 交互会话与 profile — 见 [ENGINE.md](ENGINE.md) |
 
