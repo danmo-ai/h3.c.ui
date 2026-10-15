@@ -92,6 +92,11 @@ struct h3_dit {
     int fused_patch_projection;
     int fused_patch_pack;
     int token_reduction;
+    int veda;
+    h3_weight_store *lora_weights;
+    const char *lora_key_prefix;
+    const char *lora_a_suffix;
+    const char *lora_b_suffix;
     int token_reduction_active;
     unsigned token_reduction_begin;
     unsigned token_reduction_end;
@@ -525,6 +530,137 @@ static int load_block(h3_dit *dit, h3_dit_block *block, const char *prefix,
     return 1;
 }
 
+static int configure_lora_layout(h3_dit *dit, char *error, size_t error_size) {
+    static const char *prefixes[] = {"", "diffusion_model.", "model."};
+    static const char *pairs[][2] = {
+        {"lora_A.weight", "lora_B.weight"},
+        {"lora_down.weight", "lora_up.weight"}
+    };
+    char name[192];
+    for (size_t prefix = 0; prefix < sizeof(prefixes) / sizeof(*prefixes);
+         prefix++) {
+        for (size_t pair = 0; pair < sizeof(pairs) / sizeof(*pairs); pair++) {
+            snprintf(name, sizeof(name), "%sblocks.0.attn.qkv_proj.%s",
+                     prefixes[prefix], pairs[pair][0]);
+            if (h3_weight_find(dit->lora_weights, name, NULL)) {
+                dit->lora_key_prefix = prefixes[prefix];
+                dit->lora_a_suffix = pairs[pair][0];
+                dit->lora_b_suffix = pairs[pair][1];
+                return 1;
+            }
+        }
+    }
+    fail(error, error_size,
+         "Turbo LoRA checkpoint has no DiT adapters "
+         "(expected blocks.0.attn.qkv_proj.lora_A/lora_down)");
+    return 0;
+}
+
+static int read_lora_alpha(const h3_weight_store *store, const char *name,
+                           float *value) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (tensor && header && h3_st_tensor_elements(tensor) == 1) {
+        char unused[8];
+        if (tensor->dtype == H3_DTYPE_F32) {
+            float host = 0.0f;
+            if (!h3_st_read_data(header, tensor, &host, sizeof(host), unused,
+                                 sizeof(unused))) return 0;
+            *value = host;
+            return 1;
+        }
+        if (tensor->dtype == H3_DTYPE_BF16) {
+            uint16_t host = 0;
+            if (!h3_st_read_data(header, tensor, &host, sizeof(host), unused,
+                                 sizeof(unused))) return 0;
+            uint32_t bits = (uint32_t)host << 16;
+            memcpy(value, &bits, sizeof(*value));
+            return 1;
+        }
+        return 0;
+    }
+    const char *text = h3_weight_metadata(store, name);
+    if (text && *text) {
+        char *end = NULL;
+        double parsed = strtod(text, &end);
+        if (end != text && *end == '\0' && isfinite(parsed)) {
+            *value = (float)parsed;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int merge_linear_lora(h3_dit *dit, h3_gpu_tensor *weight,
+                             const char *module, uint32_t rows,
+                             uint32_t columns, char *error,
+                             size_t error_size) {
+    char a_name[192];
+    char b_name[192];
+    snprintf(a_name, sizeof(a_name), "%s%s.%s", dit->lora_key_prefix, module,
+             dit->lora_a_suffix);
+    snprintf(b_name, sizeof(b_name), "%s%s.%s", dit->lora_key_prefix, module,
+             dit->lora_b_suffix);
+    const h3_st_tensor *a = h3_weight_find(dit->lora_weights, a_name, NULL);
+    const h3_st_tensor *b = h3_weight_find(dit->lora_weights, b_name, NULL);
+    if (!a || !b) {
+        fail(error, error_size, "Turbo LoRA is missing %s adapters", module);
+        return 0;
+    }
+    if (a->ndim != 2 || b->ndim != 2 || a->shape[1] != columns ||
+        b->shape[0] != rows || a->shape[0] != b->shape[1] ||
+        a->shape[0] == 0 || a->shape[0] > UINT32_MAX) {
+        fail(error, error_size, "Turbo LoRA adapter %s has the wrong shape",
+             module);
+        return 0;
+    }
+    uint32_t rank = (uint32_t)a->shape[0];
+    float alpha = (float)rank;
+    char alpha_name[192];
+    snprintf(alpha_name, sizeof(alpha_name), "%s%s.alpha",
+             dit->lora_key_prefix, module);
+    if (!read_lora_alpha(dit->lora_weights, alpha_name, &alpha)) {
+        snprintf(alpha_name, sizeof(alpha_name), "%s%s.lora_alpha",
+                 dit->lora_key_prefix, module);
+        read_lora_alpha(dit->lora_weights, alpha_name, &alpha);
+    }
+    float scale = alpha / (float)rank;
+    uint64_t a_shape[] = {a->shape[0], a->shape[1]};
+    uint64_t b_shape[] = {b->shape[0], b->shape[1]};
+    h3_gpu_tensor *lora_a = h3_weight_load_bf16(
+        dit->lora_weights, dit->gpu, a_name, 2, a_shape, error, error_size);
+    h3_gpu_tensor *lora_b = h3_weight_load_bf16(
+        dit->lora_weights, dit->gpu, b_name, 2, b_shape, error, error_size);
+    int ok = lora_a && lora_b &&
+             gpu_op(dit, h3_gpu_begin(dit->gpu), error, error_size,
+                    "begin Turbo LoRA merge") &&
+             gpu_op(dit, h3_gpu_lora_merge_bf16(
+                 dit->gpu, weight, lora_b, lora_a, rows, columns, rank,
+                 scale), error, error_size, "merge Turbo LoRA") &&
+             gpu_op(dit, h3_gpu_submit(dit->gpu), error, error_size,
+                    "submit Turbo LoRA merge");
+    free_tensor(&lora_a);
+    free_tensor(&lora_b);
+    return ok;
+}
+
+static int merge_block_lora(h3_dit *dit, h3_dit_block *block,
+                            const char *prefix, char *error,
+                            size_t error_size) {
+    char module[160];
+#define MERGE(field, suffix, rows, columns) do {                               \
+    snprintf(module, sizeof(module), "%s%s", prefix, suffix);                \
+    if (!merge_linear_lora(dit, block->field, module, rows, columns,           \
+                           error, error_size)) return 0;                       \
+} while (0)
+    MERGE(qkv, "attn.qkv_proj", INNER * 3, HIDDEN);
+    MERGE(out, "attn.out_proj", HIDDEN, INNER);
+    MERGE(fc1, "mlp.fc1", FFN * 2, HIDDEN);
+    MERGE(fc2, "mlp.fc2", HIDDEN, FFN);
+#undef MERGE
+    return 1;
+}
+
 static int load_block_norms(h3_dit *dit, h3_dit_block *block,
                             const char *prefix,
                             char *error, size_t error_size) {
@@ -818,8 +954,14 @@ static int refine_text(h3_dit *dit, const h3_text_embedding *text,
     int ok = source && condition_w && condition_b &&
         load_block(dit, &refiner[0], "token_refiner.blocks.0.",
                    error, error_size) &&
+        (!dit->lora_weights ||
+         merge_block_lora(dit, &refiner[0], "token_refiner.blocks.0.",
+                          error, error_size)) &&
         load_block(dit, &refiner[1], "token_refiner.blocks.1.",
-                   error, error_size);
+                   error, error_size) &&
+        (!dit->lora_weights ||
+         merge_block_lora(dit, &refiner[1], "token_refiner.blocks.1.",
+                          error, error_size));
     if (ok) final_norm = bf1(dit, "token_refiner.final_norm.weight", HIDDEN,
                              error, error_size);
     size_t rows = dit->text_rows;
@@ -1256,6 +1398,9 @@ static int load_core(h3_dit *dit, h3_dit_progress progress, void *opaque,
         } else {
             if (!load_block(dit, &dit->blocks[index], prefix,
                             error, error_size)) return 0;
+            if (dit->lora_weights &&
+                !merge_block_lora(dit, &dit->blocks[index], prefix,
+                                  error, error_size)) return 0;
             if (dit->int8_mlp &&
                 !quantize_block_mlp(dit, &dit->blocks[index],
                                     error, error_size)) return 0;
@@ -1577,6 +1722,8 @@ static h3_dit *load_dit(const char *weight_directory,
                         int use_slower_dynamic_fc1_k,
                         int use_slower_grouped_quantizer,
                         int use_int8_row_fc2,
+                        int veda,
+                        const char *turbo_lora_path,
                         const float *condition_video_rows,
                         size_t condition_video_elements,
                         const float *condition_audio_rows,
@@ -1586,11 +1733,19 @@ static h3_dit *load_dit(const char *weight_directory,
     if (error && error_size) error[0] = '\0';
     if (!weight_directory || !shader_source_path || !layout || !sigmas ||
         (ssd_streaming != 0 && ssd_streaming != 1) ||
+        (veda != 0 && veda != 1) ||
+        (veda && token_reduction) ||
+        (turbo_lora_path && ssd_streaming) ||
         !isfinite(spatial_rope_scale) || spatial_rope_scale <= 0.0f ||
         active_blocks < H3_DIT_BLOCKS / 2 ||
         active_blocks > H3_DIT_BLOCKS || core_reuse_interval < 1 ||
         core_reuse_interval > 6) {
-        fail(error, error_size, "invalid DiT load arguments");
+        fail(error, error_size,
+             veda && token_reduction ?
+             "Veda cannot be combined with token reduction" :
+             turbo_lora_path && ssd_streaming ?
+             "Turbo LoRA cannot be combined with SSD streaming" :
+             "invalid DiT load arguments");
         return NULL;
     }
     h3_dit *dit = calloc(1, sizeof(*dit));
@@ -1606,6 +1761,7 @@ static h3_dit *load_dit(const char *weight_directory,
     dit->bf16_final = getenv("H3_DIT_F32_FINAL") == NULL;
     dit->core_reuse_interval = core_reuse_interval;
     dit->ssd_streaming = ssd_streaming;
+    dit->veda = veda;
     dit->spatial_rope_scale = spatial_rope_scale;
     configure_active_blocks(dit, active_blocks);
     if (!copy_layout(dit, layout, error, error_size) ||
@@ -1629,6 +1785,17 @@ static h3_dit *load_dit(const char *weight_directory,
     if (!dit->weights) goto failed;
     dit->gpu = h3_gpu_create(shader_source_path, error, error_size);
     if (!dit->gpu) goto failed;
+    if (turbo_lora_path && *turbo_lora_path) {
+        dit->lora_weights = h3_weight_store_open(turbo_lora_path, error,
+                                                 error_size);
+        if (!dit->lora_weights ||
+            !configure_lora_layout(dit, error, error_size)) goto failed;
+        fprintf(stderr, "h3: merging Turbo LoRA from %s\n", turbo_lora_path);
+    }
+    if (veda)
+        fprintf(stderr,
+                "h3: Veda selected; using dense SDPA until the tile-sparse "
+                "kernel is wired\n");
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -1669,8 +1836,9 @@ static h3_dit *load_dit(const char *weight_directory,
     schedule_progress schedule_state = {progress, progress_opaque};
     dit->schedule = h3_dit_schedule_precompute(
         dit->weights, dit->gpu, sigmas, dit->video_condition_rows != 0,
-        dit->audio_condition_rows != 0, schedule_report, &schedule_state,
-        error, error_size);
+        dit->audio_condition_rows != 0, dit->lora_weights,
+        dit->lora_key_prefix, dit->lora_a_suffix, dit->lora_b_suffix,
+        schedule_report, &schedule_state, error, error_size);
     if (dit->schedule) {
         configure_gate_ranked_blocks(dit);
         h3_dit_schedule_prune(dit->schedule, dit->block_active,
@@ -1719,6 +1887,8 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         int veda,
+                         const char *turbo_lora_path,
                          h3_dit_progress progress, void *progress_opaque,
                          char *error, size_t error_size) {
     return load_dit(weight_directory, shader_source_path, text, layout, sigmas,
@@ -1734,7 +1904,7 @@ h3_dit *h3_dit_load_t2va(const char *weight_directory,
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
-                    use_int8_row_fc2,
+                    use_int8_row_fc2, veda, turbo_lora_path,
                     NULL, 0, NULL, 0, progress, progress_opaque,
                     error, error_size);
 }
@@ -1761,6 +1931,8 @@ h3_dit *h3_dit_load_conditioned(
                          int use_slower_dynamic_fc1_k,
                          int use_slower_grouped_quantizer,
                          int use_int8_row_fc2,
+                         int veda,
+                         const char *turbo_lora_path,
                          const float *condition_video_rows,
                          size_t condition_video_elements,
                          const float *condition_audio_rows,
@@ -1780,7 +1952,7 @@ h3_dit *h3_dit_load_conditioned(
                     use_slower_uncached_int8_scales,
                     use_slower_dynamic_fc1_k,
                     use_slower_grouped_quantizer,
-                    use_int8_row_fc2,
+                    use_int8_row_fc2, veda, turbo_lora_path,
                     condition_video_rows, condition_video_elements,
                     condition_audio_rows, condition_audio_elements,
                     progress, progress_opaque, error, error_size);
@@ -1927,12 +2099,13 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
+           dit->veda ? "DiT Veda head-major attention" :
            "DiT head-major full attention");
     else
         OP(h3_gpu_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-           "DiT full attention");
+           dit->veda ? "DiT Veda attention" : "DiT full attention");
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -3056,6 +3229,7 @@ void h3_dit_free(h3_dit *dit) {
                 dit->stream_wait_seconds);
     }
     h3_gpu_free(dit->gpu);
+    h3_weight_store_free(dit->lora_weights);
     h3_weight_store_free(dit->weights);
     h3_layout_free(&dit->layout);
     free(dit);

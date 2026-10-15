@@ -78,12 +78,25 @@ pub struct AppConfig {
     pub hf_repo: String,
     #[serde(default = "default_modelscope_repo")]
     pub modelscope_repo: String,
+    /// Separate Turbo LoRA hub (not part of the base MiniMax-H3 tree).
+    #[serde(default = "default_turbo_lora_hf_repo")]
+    pub turbo_lora_hf_repo: String,
+    #[serde(default = "default_turbo_lora_modelscope_repo")]
+    pub turbo_lora_modelscope_repo: String,
     #[serde(default)]
     pub download_source: DownloadSource,
 }
 
 fn default_modelscope_repo() -> String {
     "MiniMax/MiniMax-H3".to_string()
+}
+
+fn default_turbo_lora_hf_repo() -> String {
+    "larryvrh/MiniMax-H3-Turbo-Lora".to_string()
+}
+
+fn default_turbo_lora_modelscope_repo() -> String {
+    "larryvrh/MiniMax-H3-Turbo-Lora".to_string()
 }
 
 impl AppConfig {
@@ -100,6 +113,8 @@ impl AppConfig {
             cache_enabled: true,
             hf_repo: "MiniMaxAI/MiniMax-H3".to_string(),
             modelscope_repo: default_modelscope_repo(),
+            turbo_lora_hf_repo: default_turbo_lora_hf_repo(),
+            turbo_lora_modelscope_repo: default_turbo_lora_modelscope_repo(),
             download_source: DownloadSource::default(),
         };
         let _ = cfg.save(home);
@@ -110,6 +125,13 @@ impl AppConfig {
         match source {
             DownloadSource::Huggingface | DownloadSource::HfMirror => &self.hf_repo,
             DownloadSource::Modelscope => &self.modelscope_repo,
+        }
+    }
+
+    pub fn turbo_lora_repo_for_source(&self, source: DownloadSource) -> &str {
+        match source {
+            DownloadSource::Huggingface | DownloadSource::HfMirror => &self.turbo_lora_hf_repo,
+            DownloadSource::Modelscope => &self.turbo_lora_modelscope_repo,
         }
     }
 

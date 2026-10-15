@@ -33,20 +33,26 @@ pub enum DownloadStatus {
     Cancelled,
 }
 
-/// Which weight tree to fetch. FL2VA covers text / first-last; Ref2VA is additive.
+/// Which weight tree to fetch. FL2VA covers text / first-last; Ref2VA is additive;
+/// Turbo LoRA is a separate hub snapshot (~780 MiB recommended shard).
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum DownloadPackage {
     Fl2va,
     Ref2va,
+    TurboLora,
     All,
 }
+
+/// Preferred Turbo LoRA checkpoint (upstream README recommendation).
+pub const TURBO_LORA_PREFERRED: &str = "minimax_h3_turbo_v4_step600_ema.safetensors";
 
 impl DownloadPackage {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "fl2va" | "base" | "t2v" => Some(Self::Fl2va),
             "ref2va" | "ref" => Some(Self::Ref2va),
+            "turbo_lora" | "turbo-lora" | "turbo" | "lora" => Some(Self::TurboLora),
             "all" | "full" => Some(Self::All),
             _ => None,
         }
@@ -56,6 +62,7 @@ impl DownloadPackage {
         match self {
             Self::Fl2va => "fl2va",
             Self::Ref2va => "ref2va",
+            Self::TurboLora => "turbo_lora",
             Self::All => "all",
         }
     }
@@ -236,7 +243,7 @@ fn run_download(
         fail(
             &progress,
             format!(
-                "no remote files matched package `{}` (FL2VA/ or Ref2VA/)",
+                "no remote files matched package `{}` (FL2VA/, Ref2VA/, or Turbo LoRA)",
                 package.as_str()
             ),
             "list files",
@@ -341,7 +348,7 @@ fn is_repo_meta(path: &str) -> bool {
 }
 
 fn filter_package_files(files: Vec<RemoteFile>, package: DownloadPackage) -> Vec<RemoteFile> {
-    files
+    let filtered: Vec<RemoteFile> = files
         .into_iter()
         .filter(|f| {
             let p = f.path.as_str();
@@ -353,9 +360,46 @@ fn filter_package_files(files: Vec<RemoteFile>, package: DownloadPackage) -> Vec
                 DownloadPackage::Ref2va => {
                     p.starts_with("Ref2VA/") || p.starts_with("ref2va/") || is_repo_meta(p)
                 }
+                DownloadPackage::TurboLora => is_turbo_lora_candidate(p),
             }
         })
-        .collect()
+        .collect();
+    if package == DownloadPackage::TurboLora {
+        select_turbo_lora_files(filtered)
+    } else {
+        filtered
+    }
+}
+
+fn turbo_lora_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_turbo_lora_candidate(path: &str) -> bool {
+    let name = turbo_lora_basename(path);
+    name.starts_with("minimax_h3_turbo_") && name.ends_with(".safetensors")
+}
+
+/// Pick a single recommended Turbo LoRA shard; the hub ships many experimental
+/// multi‑GiB dumps we never want to pull for the UI package.
+fn select_turbo_lora_files(files: Vec<RemoteFile>) -> Vec<RemoteFile> {
+    const PREFERRED: &[&str] = &[
+        TURBO_LORA_PREFERRED,
+        "minimax_h3_turbo_v4_step600.safetensors",
+        "minimax_h3_turbo_4step_ema_ckpt850.safetensors",
+        "minimax_h3_turbo_4step_ema_ckpt500.safetensors",
+        "minimax_h3_turbo_4step_ema.safetensors",
+        "minimax_h3_turbo_4step.safetensors",
+    ];
+    for name in PREFERRED {
+        if let Some(file) = files
+            .iter()
+            .find(|f| turbo_lora_basename(&f.path) == *name)
+        {
+            return vec![file.clone()];
+        }
+    }
+    files.into_iter().take(1).collect()
 }
 
 fn list_files(

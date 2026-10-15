@@ -26,6 +26,12 @@ h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
+    /* Optional Turbo LoRA: merge AdaLN adapters before baking the schedule.
+     * Pass NULL / NULL suffixes to skip. */
+    const h3_weight_store *lora_weights,
+    const char *lora_key_prefix,
+    const char *lora_a_suffix,
+    const char *lora_b_suffix,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size);
 void h3_dit_schedule_free(h3_dit_schedule *schedule);

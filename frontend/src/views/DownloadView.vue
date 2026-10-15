@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from 'vue';
+import { computed, onMounted, ref, watch } from 'vue';
 import { storeToRefs } from 'pinia';
 import { useI18n } from 'vue-i18n';
 import { api, type DownloadPackageId, type DownloadSourceId, type ModelStatus } from '@/utils/api';
@@ -7,7 +7,7 @@ import { useDownloadStore } from '@/stores/download';
 
 const { t } = useI18n();
 const download = useDownloadStore();
-const { progress, busy, source, activePackage } = storeToRefs(download);
+const { progress, busy, source, activePackage, terminalEpoch } = storeToRefs(download);
 const status = ref<ModelStatus | null>(null);
 
 const sourceOptions = computed(() => [
@@ -70,13 +70,15 @@ async function refresh() {
 
 async function start(pkg: DownloadPackageId) {
   await download.start(pkg);
-  void refresh();
 }
+
+watch(terminalEpoch, () => {
+  void refresh();
+});
 
 onMounted(async () => {
   await refresh();
   await download.restore();
-  if (download.busy) void refresh();
 });
 </script>
 
@@ -154,6 +156,33 @@ onMounted(async () => {
           }}
         </DqButton>
         <p v-if="!status?.fl2va_ready" class="h3-muted">{{ t('download.needFl2vaFirst') }}</p>
+      </div>
+
+      <div class="h3-download__pkg" data-state="turbo_lora">
+        <div class="h3-download__pkg-head">
+          <div>
+            <div class="h3-download__pkg-title">{{ t('download.pkgTurboLora') }}</div>
+            <p class="h3-muted">{{ t('download.pkgTurboLoraHint') }}</p>
+          </div>
+          <span class="h3-download__pill" :data-ready="status?.turbo_lora_ready ? '1' : '0'">
+            {{ status?.turbo_lora_ready ? t('download.ready') : t('download.notReady') }}
+          </span>
+        </div>
+        <DqButton
+          size="sm"
+          type="primary"
+          :disabled="busy || !status?.fl2va_ready"
+          @click="start('turbo_lora')"
+        >
+          {{
+            busy && activePackage === 'turbo_lora'
+              ? t('download.downloading')
+              : status?.turbo_lora_ready
+                ? t('download.resumeOrRepair')
+                : t('download.startTurboLora')
+          }}
+        </DqButton>
+        <p v-if="!status?.fl2va_ready" class="h3-muted">{{ t('download.needFl2vaForTurbo') }}</p>
       </div>
     </section>
 

@@ -14,8 +14,14 @@ extern "C" {
 #define H3_DEFAULT_HEIGHT 480
 #define H3_DEFAULT_FRAMES 56
 #define H3_DEFAULT_STEPS 20
+#define H3_TURBO_LORA_STEPS 8
 #define H3_DEFAULT_DIT_LAYERS 50
 #define H3_MIN_DIT_LAYERS 35
+
+/* Inference step count implied by a Turbo LoRA checkpoint filename (for
+ * example the "4step" in minimax_h3_turbo_4step_ema_ckpt850.safetensors).
+ * Returns zero when the name carries no "<N>step" marker. */
+int h3_turbo_lora_implied_steps(const char *path);
 
 typedef struct h3_ctx h3_ctx;
 typedef struct h3_result h3_result;
@@ -87,6 +93,10 @@ typedef struct {
      * preserving their full-resolution residual. Early noisy evaluations use
      * a deeper reduced interval. This is a validated aggressive speed mode. */
     int token_reduction;
+    /* Replace dense DiT attention with Veda tile-sparse attention. */
+    int veda;
+    /* Merge the 8-step Turbo LoRA into DiT linears before quantization. */
+    int turbo_lora;
     /* Use one int8 activation scale per FC2 row and the M5 full-K kernel.
      * Faster, but more numerically aggressive than grouped int8. */
     int use_int8_row_fc2;
@@ -131,7 +141,7 @@ typedef struct {
 #define H3_PARAMS_DEFAULT { \
     H3_DEFAULT_WIDTH, H3_DEFAULT_HEIGHT, H3_DEFAULT_FRAMES, H3_DEFAULT_STEPS, \
     UINT64_C(42), NULL, NULL, NULL, NULL, 0, H3_REFERENCE_IMAGE_MATCH, \
-    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
+    1, H3_DEFAULT_DIT_LAYERS, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, NULL, NULL, NULL \
 }
 
 typedef struct {

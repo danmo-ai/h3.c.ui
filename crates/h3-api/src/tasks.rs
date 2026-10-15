@@ -1,7 +1,7 @@
 //! Serial generation task queue with SSE-friendly progress.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -352,12 +352,11 @@ impl TaskManager {
                             completed,
                             total,
                         } => {
-                            t.snapshot.phase = phase;
+                            t.snapshot.phase = phase.clone();
                             t.snapshot.completed = completed;
                             t.snapshot.total = total;
-                            if total > 0 {
-                                t.snapshot.progress = (completed as f64 / total as f64) * 100.0;
-                            }
+                            // Weight by phase so "load transformer 50/50" is not 100%.
+                            t.snapshot.progress = phase_progress(&phase, completed, total);
                         }
                         ProgressEvent::Preview {
                             jpeg_base64,
@@ -391,10 +390,27 @@ impl TaskManager {
                 if let Some(t) = tasks.get_mut(&task_id) {
                     match result {
                         Ok(r) => {
-                            t.snapshot.status = TaskStatus::Completed;
-                            t.snapshot.progress = 100.0;
-                            t.snapshot.phase = "completed".into();
-                            t.snapshot.result = Some(r);
+                            if let Some(path) = r.output_path.as_deref() {
+                                if !Path::new(path).is_file() {
+                                    t.snapshot.status = TaskStatus::Failed;
+                                    t.snapshot.error = Some(format!(
+                                        "generation reported success but output is missing: {path}"
+                                    ));
+                                    t.snapshot.phase = "failed".into();
+                                    t.snapshot.result = None;
+                                } else {
+                                    t.snapshot.status = TaskStatus::Completed;
+                                    t.snapshot.progress = 100.0;
+                                    t.snapshot.phase = "completed".into();
+                                    t.snapshot.result = Some(r);
+                                }
+                            } else {
+                                t.snapshot.status = TaskStatus::Failed;
+                                t.snapshot.error =
+                                    Some("generation reported success without an output path".into());
+                                t.snapshot.phase = "failed".into();
+                                t.snapshot.result = None;
+                            }
                         }
                         Err(crate::engine::EngineError::Cancelled) => {
                             t.snapshot.status = TaskStatus::Cancelled;
@@ -416,4 +432,29 @@ impl TaskManager {
             self.queue.lock().retain(|id| id != &task_id);
         }
     }
+}
+
+/// Map engine phase counters into an overall 0–99% bar. Only terminal
+/// `completed` sets 100%, so a failed load at 50/50 layers no longer looks done.
+fn phase_progress(phase: &str, completed: i32, total: i32) -> f64 {
+    let frac = if total > 0 {
+        (completed as f64 / total as f64).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let phase_l = phase.to_ascii_lowercase();
+    let (start, end) = if phase_l.contains("denoise") {
+        (45.0, 92.0)
+    } else if phase_l.contains("vae")
+        || phase_l.contains("mux")
+        || phase_l.contains("encode")
+        || phase_l.contains("ffmpeg")
+        || phase_l.contains("write")
+    {
+        (92.0, 99.0)
+    } else {
+        // text / schedule / transformer load / LoRA merge
+        (0.0, 45.0)
+    };
+    start + (end - start) * frac
 }

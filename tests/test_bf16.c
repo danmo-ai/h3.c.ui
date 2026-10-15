@@ -1324,6 +1324,47 @@ int main(int argc, char **argv) {
     test_euler_update(&test);
     test_token_reduction_kernels(&test);
     test_wide_token_adaln(&test);
+    {
+        enum { ROWS = 4, COLS = 4, RANK = 2 };
+        uint16_t weight_host[ROWS * COLS];
+        uint16_t b_host[ROWS * RANK];
+        uint16_t a_host[RANK * COLS];
+        uint16_t got[ROWS * COLS];
+        for (int row = 0; row < ROWS; row++)
+            for (int col = 0; col < COLS; col++)
+                weight_host[row * COLS + col] = f32_to_bf16((float)(row + col));
+        for (int row = 0; row < ROWS; row++)
+            for (int k = 0; k < RANK; k++)
+                b_host[row * RANK + k] = f32_to_bf16((float)(row + 1));
+        for (int k = 0; k < RANK; k++)
+            for (int col = 0; col < COLS; col++)
+                a_host[k * COLS + col] = f32_to_bf16(0.25f * (float)(k + 1));
+        h3_gpu_tensor *weight = own(&test, h3_gpu_tensor_from_bf16(
+            test.gpu, weight_host, ROWS * COLS));
+        h3_gpu_tensor *lora_b = own(&test, h3_gpu_tensor_from_bf16(
+            test.gpu, b_host, ROWS * RANK));
+        h3_gpu_tensor *lora_a = own(&test, h3_gpu_tensor_from_bf16(
+            test.gpu, a_host, RANK * COLS));
+        require_gpu(&test, h3_gpu_begin(test.gpu), "begin LoRA merge");
+        require_gpu(&test, h3_gpu_lora_merge_bf16(
+            test.gpu, weight, lora_b, lora_a, ROWS, COLS, RANK, 2.0f),
+                    "LoRA merge");
+        require_gpu(&test, h3_gpu_submit(test.gpu), "submit LoRA merge");
+        require(h3_gpu_tensor_read_bf16(weight, got, ROWS * COLS),
+                "read LoRA merge");
+        for (int row = 0; row < ROWS; row++) {
+            for (int col = 0; col < COLS; col++) {
+                float acc = 0.0f;
+                for (int k = 0; k < RANK; k++)
+                    acc += bf16_to_f32(b_host[row * RANK + k]) *
+                           bf16_to_f32(a_host[k * COLS + col]);
+                float want = bf16_to_f32(weight_host[row * COLS + col]) +
+                             2.0f * acc;
+                float have = bf16_to_f32(got[row * COLS + col]);
+                require(fabsf(have - want) < 2e-2f, "LoRA merge mismatch");
+            }
+        }
+    }
 
     {
         enum {

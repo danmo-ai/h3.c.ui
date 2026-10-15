@@ -234,10 +234,107 @@ cleanup:
     return result;
 }
 
+static int read_lora_alpha(const h3_weight_store *store, const char *name,
+                           float *value) {
+    const h3_st_header *header = NULL;
+    const h3_st_tensor *tensor = h3_weight_find(store, name, &header);
+    if (tensor && header && h3_st_tensor_elements(tensor) == 1) {
+        char unused[8];
+        if (tensor->dtype == H3_DTYPE_F32) {
+            float host = 0.0f;
+            if (!h3_st_read_data(header, tensor, &host, sizeof(host), unused,
+                                 sizeof(unused))) return 0;
+            *value = host;
+            return 1;
+        }
+        if (tensor->dtype == H3_DTYPE_BF16) {
+            uint16_t host = 0;
+            if (!h3_st_read_data(header, tensor, &host, sizeof(host), unused,
+                                 sizeof(unused))) return 0;
+            uint32_t bits = (uint32_t)host << 16;
+            memcpy(value, &bits, sizeof(*value));
+            return 1;
+        }
+        return 0;
+    }
+    const char *text = h3_weight_metadata(store, name);
+    if (text && *text) {
+        char *end = NULL;
+        double parsed = strtod(text, &end);
+        if (end != text && *end == '\0' && isfinite(parsed)) {
+            *value = (float)parsed;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static int merge_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *weight,
+                            const h3_weight_store *lora,
+                            const char *key_prefix,
+                            const char *a_suffix, const char *b_suffix,
+                            const char *module, uint32_t rows,
+                            uint32_t columns, char *error,
+                            size_t error_size) {
+    if (!lora || !a_suffix || !b_suffix) return 1;
+    char a_name[192];
+    char b_name[192];
+    snprintf(a_name, sizeof(a_name), "%s%s.%s",
+             key_prefix ? key_prefix : "", module, a_suffix);
+    snprintf(b_name, sizeof(b_name), "%s%s.%s",
+             key_prefix ? key_prefix : "", module, b_suffix);
+    const h3_st_tensor *a = h3_weight_find(lora, a_name, NULL);
+    const h3_st_tensor *b = h3_weight_find(lora, b_name, NULL);
+    if (!a || !b) {
+        /* Optional on older checkpoints — skip silently. */
+        return 1;
+    }
+    if (a->ndim != 2 || b->ndim != 2 || a->shape[1] != columns ||
+        b->shape[0] != rows || a->shape[0] != b->shape[1] ||
+        a->shape[0] == 0 || a->shape[0] > UINT32_MAX) {
+        fail(error, error_size, "Turbo LoRA AdaLN adapter %s has wrong shape",
+             module);
+        return 0;
+    }
+    uint32_t rank = (uint32_t)a->shape[0];
+    float alpha = (float)rank;
+    char alpha_name[192];
+    snprintf(alpha_name, sizeof(alpha_name), "%s%s.alpha",
+             key_prefix ? key_prefix : "", module);
+    if (!read_lora_alpha(lora, alpha_name, &alpha)) {
+        snprintf(alpha_name, sizeof(alpha_name), "%s%s.lora_alpha",
+                 key_prefix ? key_prefix : "", module);
+        read_lora_alpha(lora, alpha_name, &alpha);
+    }
+    float scale = alpha / (float)rank;
+    uint64_t a_shape[] = {a->shape[0], a->shape[1]};
+    uint64_t b_shape[] = {b->shape[0], b->shape[1]};
+    h3_gpu_tensor *lora_a =
+        h3_weight_load_bf16(lora, gpu, a_name, 2, a_shape, error, error_size);
+    h3_gpu_tensor *lora_b =
+        h3_weight_load_bf16(lora, gpu, b_name, 2, b_shape, error, error_size);
+    int ok = lora_a && lora_b &&
+             gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
+                    "begin Turbo LoRA AdaLN merge") &&
+             gpu_op(gpu,
+                    h3_gpu_lora_merge_bf16(gpu, weight, lora_b, lora_a, rows,
+                                           columns, rank, scale),
+                    error, error_size, "merge Turbo LoRA AdaLN") &&
+             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                    "submit Turbo LoRA AdaLN merge");
+    free_tensor(&lora_a);
+    free_tensor(&lora_b);
+    return ok;
+}
+
 h3_dit_schedule *h3_dit_schedule_precompute(
     const h3_weight_store *weights, h3_gpu *gpu,
     const h3_sigma_schedule *sigmas, int visual_condition,
     int audio_condition,
+    const h3_weight_store *lora_weights,
+    const char *lora_key_prefix,
+    const char *lora_a_suffix,
+    const char *lora_b_suffix,
     h3_dit_schedule_progress progress, void *progress_opaque,
     char *error, size_t error_size) {
     if (error && error_size) error[0] = '\0';
@@ -283,6 +380,17 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             h3_gpu_tensor_free(time);
             goto failed;
         }
+        char module[128];
+        snprintf(module, sizeof(module), "blocks.%u.adaln_proj.linear", block);
+        if (!merge_adaln_lora(gpu, weight, lora_weights, lora_key_prefix,
+                              lora_a_suffix, lora_b_suffix, module,
+                              BLOCK_OUTPUT, H3_DIT_TIME_DIM, error,
+                              error_size)) {
+            free_tensor(&weight);
+            free_tensor(&bias);
+            h3_gpu_tensor_free(time);
+            goto failed;
+        }
         snprintf(operation, sizeof(operation), "AdaLN block %u", block);
         int ok = gpu_op(gpu, h3_gpu_begin(gpu), error, error_size, operation) &&
             gpu_op(gpu, h3_gpu_linear_bf16(
@@ -308,6 +416,16 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
+    if (final_w &&
+        !merge_adaln_lora(gpu, final_w, lora_weights, lora_key_prefix,
+                          lora_a_suffix, lora_b_suffix,
+                          "final_layer.adaln_proj.linear", FINAL_OUTPUT,
+                          H3_DIT_TIME_DIM, error, error_size)) {
+        free_tensor(&final_w);
+        free_tensor(&final_b);
+        h3_gpu_tensor_free(time);
+        goto failed;
+    }
     if (!final_w || !final_b || !schedule->final ||
         !gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                 "begin final AdaLN") ||

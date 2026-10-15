@@ -19,6 +19,7 @@ size_t h3_weight_store_shards(const h3_weight_store *store);
 const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
                                    const char *name,
                                    const h3_st_header **header);
+const char *h3_weight_metadata(const h3_weight_store *store, const char *key);
 
 /* Validate an exact BF16 shape, allocate a shared Metal buffer, and read the
  * payload directly into that buffer with no intermediate host allocation. */

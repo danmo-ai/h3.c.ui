@@ -12,6 +12,7 @@
 #include "h3_video_vae.h"
 #include "h3_vision_encoder.h"
 
+#include <dirent.h>
 #include <errno.h>
 #include <math.h>
 #include <stdarg.h>
@@ -168,11 +169,12 @@ static char *h3_prepared_key(const char *conditioning,
     if (!h3_key_append(
             &key,
             "%s|shape=%dx%dx%d|steps=%d|layers=%d|reuse-core=%d|reduce=%d"
-            "|row-fc2=%d|reference-rope=%d|ssd-streaming=%d"
-            "|slow=%d%d%d%d%d%d%d%d%d%d",
+            "|veda=%d|turbo-lora=%d|row-fc2=%d|reference-rope=%d"
+            "|ssd-streaming=%d|slow=%d%d%d%d%d%d%d%d%d%d",
             conditioning, render_width, render_height, params->frames,
             params->steps, params->dit_layers, params->core_reuse,
-            params->token_reduction, params->use_int8_row_fc2,
+            params->token_reduction, params->veda, params->turbo_lora,
+            params->use_int8_row_fc2,
             params->use_reference_rope,
             params->ssd_streaming,
             params->use_slower_bf16_mlp,
@@ -378,6 +380,141 @@ static char *h3_path(const char *root, const char *relative) {
     return result;
 }
 
+static int h3_is_dir(const char *path) {
+    struct stat status;
+    return path && stat(path, &status) == 0 && S_ISDIR(status.st_mode);
+}
+
+static int h3_is_safetensors(const char *path) {
+    size_t length = path ? strlen(path) : 0;
+    return length > 12 && !strcmp(path + length - 12, ".safetensors") &&
+           h3_is_file(path);
+}
+
+int h3_turbo_lora_implied_steps(const char *path) {
+    if (!path) return 0;
+    const char *name = strrchr(path, '/');
+    name = name ? name + 1 : path;
+    for (const char *at = name; at[0] && at[1] && at[2] && at[3]; at++) {
+        if (strncmp(at, "step", 4) != 0) continue;
+        const char *digits = at;
+        while (digits > name && digits[-1] >= '0' && digits[-1] <= '9')
+            digits--;
+        if (digits == at) continue;
+        long value = 0;
+        for (const char *digit = digits; digit < at; digit++) {
+            value = value * 10 + (*digit - '0');
+            if (value > H3_MAX_STEPS) break;
+        }
+        if (value >= 2 && value <= H3_MAX_STEPS) return (int)value;
+    }
+    return 0;
+}
+
+/* A Turbo LoRA directory should hold one checkpoint, but nothing stops a user
+ * from dropping several single-file checkpoints side by side. Opening the
+ * whole directory would blend duplicate tensor names across checkpoints, so
+ * pick a single shard deterministically instead. */
+static int h3_compare_names(const void *left, const void *right) {
+    const char *const *a = left;
+    const char *const *b = right;
+    return strcmp(*a, *b);
+}
+
+static char *h3_pick_turbo_lora_shard(const char *directory) {
+    static const char *preferred[] = {
+        "minimax_h3_turbo_v4_step600_ema.safetensors",
+        "minimax_h3_turbo_v4_step600.safetensors"
+    };
+    static const char suffix[] = ".safetensors";
+    DIR *stream = opendir(directory);
+    if (!stream) return NULL;
+    char **names = NULL;
+    size_t count = 0, capacity = 0;
+    struct dirent *entry;
+    while ((entry = readdir(stream)) != NULL) {
+        size_t length = strlen(entry->d_name);
+        if (entry->d_name[0] == '.' || length <= sizeof(suffix) - 1 ||
+            strcmp(entry->d_name + length - (sizeof(suffix) - 1), suffix))
+            continue;
+        if (count == capacity) {
+            size_t next = capacity ? capacity * 2 : 8;
+            char **grown = realloc(names, next * sizeof(*grown));
+            if (!grown) {
+                for (size_t index = 0; index < count; index++) free(names[index]);
+                free(names);
+                closedir(stream);
+                return NULL;
+            }
+            names = grown;
+            capacity = next;
+        }
+        names[count] = strdup(entry->d_name);
+        if (!names[count]) {
+            for (size_t index = 0; index < count; index++) free(names[index]);
+            free(names);
+            closedir(stream);
+            return NULL;
+        }
+        count++;
+    }
+    closedir(stream);
+    if (!count) {
+        free(names);
+        return NULL;
+    }
+    qsort(names, count, sizeof(*names), h3_compare_names);
+    const char *chosen = names[0];
+    for (size_t candidate = 0;
+         candidate < sizeof(preferred) / sizeof(*preferred); candidate++) {
+        for (size_t index = 0; index < count; index++) {
+            if (!strcmp(names[index], preferred[candidate])) {
+                chosen = names[index];
+                candidate = sizeof(preferred) / sizeof(*preferred);
+                break;
+            }
+        }
+    }
+    if (count > 1) {
+        fprintf(stderr,
+                "h3: warning: %s holds %zu Turbo LoRA checkpoints; using %s\n",
+                directory, count, chosen);
+    }
+    size_t length = strlen(directory) + strlen(chosen) + 2;
+    char *path = malloc(length);
+    if (path) snprintf(path, length, "%s/%s", directory, chosen);
+    for (size_t index = 0; index < count; index++) free(names[index]);
+    free(names);
+    return path;
+}
+
+static char *h3_resolve_turbo_lora(const h3_ctx *ctx, int ref2va) {
+    const char *env = getenv("H3_TURBO_LORA");
+    if (env && *env) {
+        char *copy = strdup(env);
+        return copy;
+    }
+    const char *relatives[] = {
+        "turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors",
+        "turbo_lora",
+        ref2va ? "Ref2VA/turbo_lora" : "FL2VA/turbo_lora"
+    };
+    for (size_t index = 0; index < sizeof(relatives) / sizeof(*relatives);
+         index++) {
+        char *path = h3_path(ctx->model_dir, relatives[index]);
+        if (!path) continue;
+        if (h3_is_safetensors(path)) return path;
+        if (h3_is_dir(path)) {
+            char *shard = h3_pick_turbo_lora_shard(path);
+            free(path);
+            if (shard) return shard;
+            continue;
+        }
+        free(path);
+    }
+    return NULL;
+}
+
 static int h3_require_file(h3_ctx *ctx, const char *relative) {
     char *path = h3_path(ctx->model_dir, relative);
     if (!path) {
@@ -534,6 +671,22 @@ static int h3_valid_params(h3_ctx *ctx, const h3_params *params) {
     }
     if (params->token_reduction != 0 && params->token_reduction != 1) {
         h3_set_error(ctx, "token reduction must be zero or one");
+        return 0;
+    }
+    if (params->veda != 0 && params->veda != 1) {
+        h3_set_error(ctx, "Veda must be zero or one");
+        return 0;
+    }
+    if (params->turbo_lora != 0 && params->turbo_lora != 1) {
+        h3_set_error(ctx, "Turbo LoRA must be zero or one");
+        return 0;
+    }
+    if (params->veda && params->token_reduction) {
+        h3_set_error(ctx, "Veda cannot be combined with token reduction");
+        return 0;
+    }
+    if (params->turbo_lora && params->ssd_streaming) {
+        h3_set_error(ctx, "Turbo LoRA cannot be combined with SSD streaming");
         return 0;
     }
     if (params->use_int8_row_fc2 != 0 &&
@@ -854,6 +1007,10 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         return NULL;
     }
     if (!h3_valid_params(ctx, params)) return NULL;
+    /* Turbo LoRA may retune the step count once the checkpoint is known;
+     * keep the caller's struct immutable and adjust a local copy. */
+    h3_params adjusted = *params;
+    params = &adjusted;
     int render_width = params->render_width ? params->render_width :
                                                params->width;
     int render_height = params->render_height ? params->render_height :
@@ -928,10 +1085,37 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         "Ref2VA/video_vae/source" : "FL2VA/video_vae/source");
     char *audio_vae_path = h3_path(ctx->model_dir, ref2va ?
         "Ref2VA/audio_vae" : "FL2VA/audio_vae");
+    char *turbo_lora_path = NULL;
     if (!tokenizer_path || !text_path || !dit_path || !vae_path ||
         !audio_vae_path) {
         h3_set_error(ctx, "out of memory resolving generation model paths");
         goto cleanup;
+    }
+    if (params->turbo_lora) {
+        turbo_lora_path = h3_resolve_turbo_lora(ctx, ref2va);
+        if (!turbo_lora_path) {
+            h3_set_error(ctx,
+                "Turbo LoRA checkpoint not found (set H3_TURBO_LORA or "
+                "place shards in turbo_lora/)");
+            goto cleanup;
+        }
+        int implied = h3_turbo_lora_implied_steps(turbo_lora_path);
+        int target = implied > 0 ? implied : H3_TURBO_LORA_STEPS;
+        if (params->steps != target) {
+            if (params->steps == H3_DEFAULT_STEPS ||
+                params->steps == H3_TURBO_LORA_STEPS) {
+                fprintf(stderr,
+                        "h3: Turbo LoRA checkpoint targets %d steps; using %d "
+                        "instead of the %d-step default\n",
+                        target, target, params->steps);
+                adjusted.steps = target;
+            } else {
+                fprintf(stderr,
+                        "h3: warning: Turbo LoRA checkpoint targets %d steps "
+                        "but %d were requested\n",
+                        target, params->steps);
+            }
+        }
     }
     conditioning_key = h3_conditioning_key(
         prompt, params, render_width, render_height, ref2va);
@@ -1492,6 +1676,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params->veda,
+            turbo_lora_path,
             condition_video_rows, condition_video_elements,
             condition_audio_rows, condition_audio_elements,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
@@ -1513,6 +1699,8 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             params->use_slower_dynamic_fc1_k,
             params->use_slower_grouped_quantizer,
             params->use_int8_row_fc2,
+            params->veda,
+            turbo_lora_path,
             h3_dit_progress_bridge, &progress, detail, sizeof(detail));
     }
     if (!dit) {
@@ -1695,6 +1883,7 @@ cleanup:
     free(decoder_key);
     free(tokenizer_path); free(text_path); free(dit_path); free(vae_path);
     free(audio_vae_path);
+    free(turbo_lora_path);
     h3_tokenizer_free(tokenizer);
     h3_tokenizer_ids_free(ids);
     for (size_t image = 0; image < visual_capacity; image++) {

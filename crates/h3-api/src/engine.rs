@@ -229,6 +229,10 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub token_reduction: bool,
     #[serde(default)]
+    pub veda: bool,
+    #[serde(default)]
+    pub turbo_lora: bool,
+    #[serde(default)]
     pub ssd_streaming: bool,
     #[serde(default)]
     pub use_int8_row_fc2: bool,
@@ -383,6 +387,11 @@ impl Engine {
             unsafe { h3_free(ctx) };
         }
         *self.model_dir.lock() = None;
+    }
+
+    /// True when a context is already resident — never triggers a load.
+    pub fn is_loaded(&self) -> bool {
+        self.ctx.lock().is_some()
     }
 
     pub fn device_info(&self) -> Result<DeviceInfo, EngineError> {
@@ -570,6 +579,8 @@ impl Engine {
         params.dit_layers = req.dit_layers;
         params.core_reuse = req.core_reuse;
         params.token_reduction = if req.token_reduction { 1 } else { 0 };
+        params.veda = if req.veda { 1 } else { 0 };
+        params.turbo_lora = if req.turbo_lora { 1 } else { 0 };
         params.use_int8_row_fc2 = if req.use_int8_row_fc2 { 1 } else { 0 };
         params.use_reference_rope = if req.use_reference_rope { 1 } else { 0 };
         params.ssd_streaming = if req.ssd_streaming { 1 } else { 0 };
@@ -707,14 +718,52 @@ pub fn model_status_from_dir(model_dir: &Path) -> ModelStatusFs {
     let ref2va = model_dir
         .join("Ref2VA/transformer/model.safetensors.index.json")
         .is_file();
+    let turbo_lora = turbo_lora_ready(model_dir);
     let disk_bytes = dir_size(model_dir).unwrap_or(0);
     ModelStatusFs {
         model_dir: model_dir.to_string_lossy().into_owned(),
         fl2va_ready: missing.is_empty(),
         ref2va_ready: ref2va,
+        turbo_lora_ready: turbo_lora,
         missing_paths: missing,
         disk_bytes,
     }
+}
+
+fn turbo_lora_ready(model_dir: &Path) -> bool {
+    // Keep in sync with crate::download::TURBO_LORA_PREFERRED (avoid cycle).
+    const PREFERRED: &str = "minimax_h3_turbo_v4_step600_ema.safetensors";
+    let preferred = model_dir.join("turbo_lora").join(PREFERRED);
+    if preferred.is_file() {
+        return true;
+    }
+    for rel in [
+        "turbo_lora",
+        "FL2VA/turbo_lora",
+        "Ref2VA/turbo_lora",
+    ] {
+        let path = model_dir.join(rel);
+        if path.is_file()
+            && path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("safetensors"))
+        {
+            return true;
+        }
+        if path.is_dir() {
+            if let Ok(entries) = std::fs::read_dir(&path) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if name.ends_with(".safetensors") {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -722,6 +771,7 @@ pub struct ModelStatusFs {
     pub model_dir: String,
     pub fl2va_ready: bool,
     pub ref2va_ready: bool,
+    pub turbo_lora_ready: bool,
     pub missing_paths: Vec<String>,
     pub disk_bytes: u64,
 }

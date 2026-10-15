@@ -540,6 +540,12 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 int h3_gpu_add_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);
+/* W[rows, cols] += scale * B[rows, rank] @ A[rank, cols], in place. */
+int h3_gpu_lora_merge_bf16(h3_gpu *gpu, h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *lora_b,
+                           const h3_gpu_tensor *lora_a,
+                           uint32_t rows, uint32_t columns, uint32_t rank,
+                           float scale);
 int h3_gpu_sub_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                     const h3_gpu_tensor *left, const h3_gpu_tensor *right,
                     uint32_t elements);

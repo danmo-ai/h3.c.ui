@@ -56,6 +56,7 @@ onUnmounted(() => {
           controls
           autoplay
           playsinline
+          preload="metadata"
         />
       </div>
     </div>

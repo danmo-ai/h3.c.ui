@@ -14,7 +14,7 @@ const DRAWER_KEY = 'composer.drawer.open';
 
 const { t } = useI18n();
 const status = ref<ModelStatus | null>(null);
-const outputs = ref<Array<{ name: string; bytes: number }>>([]);
+const outputs = ref<Array<{ name: string; bytes: number; modified?: number }>>([]);
 const drawerOpen = ref(getItem(DRAWER_KEY) === '1');
 const failedOpen = ref(false);
 const failedCount = ref(0);
@@ -29,7 +29,11 @@ async function refreshStatus() {
 
 async function refreshOutputs() {
   const res = await api.listOutputs();
-  outputs.value = res.outputs.map((o) => ({ name: o.name, bytes: o.bytes }));
+  outputs.value = res.outputs.map((o) => ({
+    name: o.name,
+    bytes: o.bytes,
+    modified: o.modified,
+  }));
 }
 
 async function refreshFailedCount() {
@@ -62,6 +66,8 @@ function openLightbox(name: string) {
 }
 
 async function onGenerated() {
+  // File may still be flushing when the SSE "completed" event arrives.
+  await new Promise((r) => setTimeout(r, 150));
   await refreshOutputs();
   await refreshFailedCount();
 }
@@ -94,9 +100,10 @@ onUnmounted(() => {
     <div v-else class="h3-studio-grid">
       <CreateCard
         v-for="o in outputs"
-        :key="o.name"
+        :key="`${o.name}:${o.modified ?? 0}`"
         :name="o.name"
         :bytes="o.bytes"
+        :modified="o.modified"
         @remove="removeOutput(o.name)"
         @open="openLightbox(o.name)"
       />

@@ -35,6 +35,13 @@ struct linear_args {
     uint has_bias;
 };
 
+struct lora_merge_args {
+    uint rows;
+    uint cols;
+    uint rank;
+    float scale;
+};
+
 struct int8_quant_args {
     uint rows;
     uint columns;
@@ -4025,6 +4032,24 @@ kernel void h3_gqa_causal_bf16(
         }
         output[q_base + d] = h3_f32_to_bf16(sum);
     }
+}
+
+kernel void h3_lora_merge_bf16(device ushort *weight [[buffer(0)]],
+                               device const ushort *lora_b [[buffer(1)]],
+                               device const ushort *lora_a [[buffer(2)]],
+                               constant lora_merge_args &args [[buffer(3)]],
+                               uint2 gid [[thread_position_in_grid]]) {
+    uint col = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || col >= args.cols) return;
+    float acc = 0.0f;
+    for (uint k = 0; k < args.rank; k++) {
+        acc = fma(h3_bf16_to_f32(lora_b[row * args.rank + k]),
+                  h3_bf16_to_f32(lora_a[k * args.cols + col]), acc);
+    }
+    uint index = row * args.cols + col;
+    weight[index] = h3_f32_to_bf16(
+        h3_bf16_to_f32(weight[index]) + args.scale * acc);
 }
 
 kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],

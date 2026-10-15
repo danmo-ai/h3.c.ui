@@ -160,6 +160,8 @@ static void print_help(void) {
     puts("  !layers [N]              Set or show active DiT blocks");
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
+    puts("  !veda [on|off]            Toggle Veda tile-sparse attention");
+    puts("  !turbo-lora [on|off]      Toggle 8-step Turbo LoRA merge");
     puts("  !ssd-streaming [on|off]   Toggle original-BF16 SSD streaming");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");
@@ -189,10 +191,12 @@ static void print_status(const h3_cli_state *state) {
     printf("\nFrames: %d requested, %d generated (%.3g seconds)\n",
            state->params.frames, aligned, (double)aligned / H3_FPS);
     printf("Steps: %d | reuse: %d | layers: %d | core reuse: %d | "
-           "tokens: %s | weights: %s | FC2: %s\n",
+           "tokens: %s | attention: %s | turbo: %s | weights: %s | FC2: %s\n",
            state->params.steps, state->params.denoise_reuse,
            state->params.dit_layers, state->params.core_reuse,
            state->params.token_reduction ? "reduced" : "full",
+           state->params.veda ? "Veda" : "SDPA",
+           state->params.turbo_lora ? "on" : "off",
            state->params.ssd_streaming ? "SSD BF16" : "resident",
            state->params.ssd_streaming ? "BF16" :
            state->params.use_int8_row_fc2 ? "int8 row" : "int8 grouped");
@@ -581,9 +585,34 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         int value;
         if (!parse_toggle(argument, state->params.token_reduction, &value))
             fprintf(stderr, "h3: use on or off\n");
+        else if (value && state->params.veda)
+            fprintf(stderr, "h3: disable !veda before token reduction\n");
         else {
             state->params.token_reduction = value;
             printf("Token reduction: %s\n", value ? "on" : "off");
+        }
+    } else if (!strcasecmp(command, "veda")) {
+        int value;
+        if (!parse_toggle(argument, state->params.veda, &value))
+            fprintf(stderr, "h3: use on or off\n");
+        else if (value && state->params.token_reduction)
+            fprintf(stderr, "h3: disable !token-reduction before Veda\n");
+        else {
+            state->params.veda = value;
+            printf("Veda attention: %s\n", value ? "on" : "off");
+        }
+    } else if (!strcasecmp(command, "turbo-lora")) {
+        int value;
+        if (!parse_toggle(argument, state->params.turbo_lora, &value))
+            fprintf(stderr, "h3: use on or off\n");
+        else if (value && state->params.ssd_streaming)
+            fprintf(stderr, "h3: disable !ssd-streaming before Turbo LoRA\n");
+        else {
+            state->params.turbo_lora = value;
+            if (value && state->params.steps == H3_DEFAULT_STEPS)
+                state->params.steps = H3_TURBO_LORA_STEPS;
+            printf("Turbo LoRA: %s (steps %d)\n", value ? "on" : "off",
+                   state->params.steps);
         }
     } else if (!strcasecmp(command, "ssd-streaming")) {
         int value;
@@ -592,6 +621,9 @@ static int process_command(h3_cli_state *state, char *line, int *repeat) {
         else if (value && state->params.use_int8_row_fc2)
             fprintf(stderr,
                     "h3: disable !int8-row-fc2 before SSD streaming\n");
+        else if (value && state->params.turbo_lora)
+            fprintf(stderr,
+                    "h3: disable !turbo-lora before SSD streaming\n");
         else {
             state->params.ssd_streaming = value;
             printf("SSD streaming: %s\n", value ? "on" : "off");

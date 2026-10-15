@@ -14,6 +14,8 @@ export const useDownloadStore = defineStore('download', () => {
   const busy = ref(false);
   const source = ref<DownloadSourceId>('modelscope');
   const activePackage = ref<DownloadPackageId | null>(null);
+  /** Bumps when a download reaches a terminal state so views can refresh readiness. */
+  const terminalEpoch = ref(0);
   let es: EventSource | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -39,7 +41,17 @@ export const useDownloadStore = defineStore('download', () => {
       void api
         .downloadCurrent()
         .then((cur) => {
-          if (!cur.task_id || cur.task_id !== taskId) return;
+          // API restart / cleared manager — unlock the UI.
+          if (!cur.task_id || cur.status === 'idle') {
+            if (busy.value) {
+              stopStream();
+              busy.value = false;
+              activePackage.value = null;
+              terminalEpoch.value += 1;
+            }
+            return;
+          }
+          if (cur.task_id !== taskId) return;
           progress.value = cur;
           if (
             cur.status === 'completed' ||
@@ -60,6 +72,7 @@ export const useDownloadStore = defineStore('download', () => {
     busy.value = false;
     activePackage.value = null;
     progress.value = data;
+    terminalEpoch.value += 1;
     if (data.status === 'completed') {
       toast.success(data.message || 'Download complete');
     } else if (data.status === 'failed') {
@@ -141,6 +154,7 @@ export const useDownloadStore = defineStore('download', () => {
     busy,
     source,
     activePackage,
+    terminalEpoch,
     active,
     attachStream,
     restore,

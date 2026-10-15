@@ -58,6 +58,8 @@ const form = reactive({
   dit_layers: 50,
   core_reuse: 1,
   token_reduction: false,
+  veda: false,
+  turbo_lora: false,
   ssd_streaming: false,
   use_int8_row_fc2: false,
   use_reference_rope: false,
@@ -82,6 +84,8 @@ let es: EventSource | null = null;
 const speedSwitches = computed(() =>
   [
     { key: 'token_reduction' as const, label: t('create.sw.tokenReduction') },
+    { key: 'veda' as const, label: t('create.sw.veda') },
+    { key: 'turbo_lora' as const, label: t('create.sw.turboLora') },
     { key: 'ssd_streaming' as const, label: t('create.sw.ssdStreaming') },
     { key: 'use_int8_row_fc2' as const, label: t('create.sw.int8RowFc2') },
     { key: 'use_reference_rope' as const, label: t('create.sw.referenceRope') },
@@ -117,6 +121,13 @@ const busy = computed(
 );
 
 watch(busy, (v) => emit('update:busy', v), { immediate: true });
+
+watch(
+  () => form.turbo_lora,
+  (on) => {
+    if (on && form.steps === 20) form.steps = 8;
+  },
+);
 
 const canGenerate = computed(() => {
   if (!props.status?.fl2va_ready) return false;
@@ -182,6 +193,8 @@ function buildBody(): GenerateBody {
     dit_layers: form.dit_layers,
     core_reuse: form.core_reuse,
     token_reduction: form.token_reduction,
+    veda: form.veda,
+    turbo_lora: form.turbo_lora,
     ssd_streaming: form.ssd_streaming,
     use_int8_row_fc2: form.use_int8_row_fc2,
     use_reference_rope: form.use_reference_rope,
@@ -225,6 +238,18 @@ function buildBody(): GenerateBody {
 
 async function generate() {
   try {
+    if (form.veda && form.token_reduction) {
+      toast.error('Veda cannot be combined with token reduction');
+      return;
+    }
+    if (form.turbo_lora && form.ssd_streaming) {
+      toast.error('Turbo LoRA cannot be combined with SSD streaming');
+      return;
+    }
+    if (form.turbo_lora && props.status && props.status.turbo_lora_ready === false) {
+      toast.error(t('create.turboLoraMissing'));
+      return;
+    }
     const { task_id } = await api.generate(buildBody());
     closeEs();
     es = new EventSource(api.taskStreamUrl(task_id));
@@ -476,9 +501,23 @@ defineExpose({ closeEs });
       <section v-if="task" class="h3-composer__section h3-composer__live">
         <div class="h3-composer__live-meta">
           <span>{{ task.phase }}</span>
-          <span>{{ Math.round(task.progress) }}%</span>
+          <span v-if="task.status === 'failed'" class="h3-composer__live-failed">
+            {{ t('create.failedLabel') }}
+          </span>
+          <span v-else-if="task.status === 'cancelled'">{{ t('create.cancelledLabel') }}</span>
+          <span v-else-if="task.status === 'completed'">100%</span>
+          <span v-else>{{ Math.round(task.progress) }}%</span>
         </div>
-        <DqProgress :percentage="Math.round(task.progress)" />
+        <DqProgress
+          :percentage="
+            task.status === 'failed'
+              ? Math.min(Math.round(task.progress), 99)
+              : Math.round(task.progress)
+          "
+        />
+        <p v-if="task.status === 'failed' && task.error" class="h3-composer__live-error">
+          {{ task.error }}
+        </p>
         <img v-if="previewSrc" class="h3-preview" :src="previewSrc" alt="preview" />
       </section>
     </div>
@@ -678,6 +717,21 @@ defineExpose({ closeEs });
   justify-content: space-between;
   font-size: var(--dq-font-size-caption, 12px);
   opacity: 0.65;
+}
+
+.h3-composer__live-failed {
+  color: var(--dq-danger, #ff453a);
+  opacity: 1;
+  font-weight: 650;
+}
+
+.h3-composer__live-error {
+  margin: 0;
+  font-size: var(--dq-font-size-caption, 12px);
+  line-height: 1.45;
+  color: var(--dq-danger, #ff453a);
+  word-break: break-word;
+  white-space: pre-wrap;
 }
 
 .h3-composer__footer {

@@ -71,6 +71,8 @@ static void test_temporal_and_canvas(void) {
 static void test_schedule(void) {
     h3_params defaults = H3_PARAMS_DEFAULT;
     CHECK(defaults.steps == 20);
+    CHECK(defaults.veda == 0);
+    CHECK(defaults.turbo_lora == 0);
     CHECK(defaults.use_reference_rope == 0);
 
     h3_sigma_schedule schedule;
@@ -258,7 +260,10 @@ static void test_safetensors(void) {
     int descriptor = mkstemp(path);
     CHECK(descriptor >= 0);
     const char header_json[] =
-        "{\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
+        "{\"__metadata__\":{\"application\":\"h3 test\","
+        "\"blocks.0.attn.qkv_proj.lora_alpha\":\"32\",\"ignored\":42,"
+        "\"nested\":{\"a\":[1,2]}},"
+        "\"x\":{\"dtype\":\"F32\",\"shape\":[2,3],\"data_offsets\":[0,24]},"
         "\"scalar\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[24,26]}}";
     uint64_t length = sizeof(header_json) - 1;
     unsigned char prefix[8];
@@ -290,8 +295,31 @@ static void test_safetensors(void) {
     CHECK(scalar && scalar->dtype == H3_DTYPE_BF16 && scalar->ndim == 0);
     CHECK(scalar->data_end - scalar->data_begin == 2);
     CHECK(h3_st_tensor_elements(scalar) == 1);
+    const char *application = h3_st_metadata(&header, "application");
+    CHECK(application && !strcmp(application, "h3 test"));
+    const char *alpha = h3_st_metadata(
+        &header, "blocks.0.attn.qkv_proj.lora_alpha");
+    CHECK(alpha && !strcmp(alpha, "32"));
+    CHECK(!h3_st_metadata(&header, "ignored"));
+    CHECK(!h3_st_metadata(&header, "missing"));
     h3_st_free_header(&header);
     CHECK(unlink(path) == 0);
+}
+
+static void test_turbo_lora_implied_steps(void) {
+    CHECK(h3_turbo_lora_implied_steps(NULL) == 0);
+    CHECK(h3_turbo_lora_implied_steps(
+        "turbo_lora/minimax_h3_turbo_v4_step600_ema.safetensors") == 0);
+    CHECK(h3_turbo_lora_implied_steps(
+        "minimax_h3_turbo_4step_ema_ckpt850.safetensors") == 4);
+    CHECK(h3_turbo_lora_implied_steps(
+        "/models/MiniMax-H3/turbo_lora/minimax_h3_turbo_4step_ema_ckpt500"
+        ".safetensors") == 4);
+    CHECK(h3_turbo_lora_implied_steps("custom_8step_lora.safetensors") == 8);
+    CHECK(h3_turbo_lora_implied_steps("lora.safetensors") == 0);
+    CHECK(h3_turbo_lora_implied_steps("step_lora.safetensors") == 0);
+    CHECK(h3_turbo_lora_implied_steps("lora_1step.safetensors") == 0);
+    CHECK(h3_turbo_lora_implied_steps("lora_2000step.safetensors") == 0);
 }
 
 static void test_rng_and_solver(void) {
@@ -404,6 +432,7 @@ int main(void) {
     test_layout_fl2va();
     test_layout_ref2va();
     test_safetensors();
+    test_turbo_lora_implied_steps();
     test_rng_and_solver();
     test_rgb_resize();
     test_dit_row_conversions();

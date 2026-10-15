@@ -7,19 +7,15 @@ use crate::state::AppState;
 
 pub async fn status(State(state): State<AppState>) -> Json<Value> {
     let cfg = state.config.lock().clone();
+    // Filesystem readiness only — never call ensure_loaded here. Loading MiniMax-H3
+    // can take minutes and would freeze Download/Create status refresh after a fetch.
     let fs = model_status_from_dir(&cfg.model_dir);
-    let mut loaded = false;
-    let mut model = None;
-    if fs.fl2va_ready {
-        if state
-            .engine
-            .ensure_loaded(&cfg.model_dir, cfg.cache_enabled)
-            .is_ok()
-        {
-            loaded = true;
-            model = state.engine.model_info().ok();
-        }
-    }
+    let loaded = state.engine.is_loaded();
+    let model = if loaded {
+        state.engine.model_info().ok()
+    } else {
+        None
+    };
     let sources: Vec<Value> = crate::config::DownloadSource::all()
         .iter()
         .copied()
@@ -35,12 +31,15 @@ pub async fn status(State(state): State<AppState>) -> Json<Value> {
         "model_dir": fs.model_dir,
         "fl2va_ready": fs.fl2va_ready,
         "ref2va_ready": fs.ref2va_ready,
+        "turbo_lora_ready": fs.turbo_lora_ready,
         "missing_paths": fs.missing_paths,
         "disk_bytes": fs.disk_bytes,
         "loaded": loaded,
         "model": model,
         "hf_repo": cfg.hf_repo,
         "modelscope_repo": cfg.modelscope_repo,
+        "turbo_lora_hf_repo": cfg.turbo_lora_hf_repo,
+        "turbo_lora_modelscope_repo": cfg.turbo_lora_modelscope_repo,
         "download_source": cfg.download_source.as_str(),
         "sources": sources,
     }))

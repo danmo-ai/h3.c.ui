@@ -462,6 +462,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_token_expand_delta_bf16",
             @"h3_token_expand_adaln_bf16",
             @"h3_euler_bf16", @"h3_silu_mul_bf16",
+            @"h3_lora_merge_bf16",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
@@ -1008,6 +1009,7 @@ void h3_gpu_profile_mark(h3_gpu *opaque, const char *phase) {
 }
 
 typedef struct { uint32_t rows, input_dim, output_dim, has_bias; } linear_args;
+typedef struct { uint32_t rows, cols, rank; float scale; } lora_merge_args;
 typedef struct { uint32_t rows, columns; float clip; } int8_quant_args;
 typedef struct {
     uint32_t rows, padded_rows, heads, head_dim;
@@ -4352,6 +4354,32 @@ int h3_gpu_gqa_causal_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
     stats.direct_dispatches++;
     gpu.stats = stats;
     return 1;
+}
+
+int h3_gpu_lora_merge_bf16(h3_gpu *opaque, h3_gpu_tensor *weight,
+                           const h3_gpu_tensor *lora_b,
+                           const h3_gpu_tensor *lora_a,
+                           uint32_t rows, uint32_t columns, uint32_t rank,
+                           float scale) {
+    H3GPU *gpu = GPU(opaque);
+    if (!rows || !columns || !rank) {
+        h3_gpu_set_error(gpu, @"LoRA merge requires nonzero rank and shape");
+        return 0;
+    }
+    if (!h3_gpu_require_bf16(gpu, weight, (size_t)rows * columns,
+                              @"LoRA weight") ||
+        !h3_gpu_require_bf16(gpu, lora_b, (size_t)rows * rank,
+                              @"LoRA B") ||
+        !h3_gpu_require_bf16(gpu, lora_a, (size_t)rank * columns,
+                              @"LoRA A")) return 0;
+    lora_merge_args args = {rows, columns, rank, scale};
+    return h3_gpu_dispatch_2d(gpu, @"h3_lora_merge_bf16", columns, rows,
+        ^(id<MTLComputeCommandEncoder> encoder) {
+            [encoder setBuffer:TENSOR(weight).buffer offset:0 atIndex:0];
+            [encoder setBuffer:TENSOR(lora_b).buffer offset:0 atIndex:1];
+            [encoder setBuffer:TENSOR(lora_a).buffer offset:0 atIndex:2];
+            [encoder setBytes:&args length:sizeof(args) atIndex:3];
+        });
 }
 
 int h3_gpu_add_bf16(h3_gpu *opaque, h3_gpu_tensor *output,

@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 
 struct h3_weight_store {
     h3_st_header *headers;
@@ -38,11 +39,55 @@ static void free_paths(char **paths, size_t count) {
     free(paths);
 }
 
+static h3_weight_store *open_store_from_paths(char **paths, size_t count,
+                                             char *error, size_t error_size) {
+    h3_weight_store *store = calloc(1, sizeof(*store));
+    if (!store) {
+        fail(error, error_size, "out of memory creating weight store");
+        return NULL;
+    }
+    store->headers = calloc(count, sizeof(*store->headers));
+    if (!store->headers) {
+        fail(error, error_size, "out of memory allocating weight headers");
+        free(store);
+        return NULL;
+    }
+    store->count = count;
+    for (size_t index = 0; index < count; index++) {
+        char detail[384];
+        if (!h3_st_read_header(paths[index], &store->headers[index], detail,
+                               sizeof(detail))) {
+            fail(error, error_size, "%s", detail);
+            h3_weight_store_free(store);
+            return NULL;
+        }
+    }
+    return store;
+}
+
 h3_weight_store *h3_weight_store_open(const char *directory,
                                       char *error, size_t error_size) {
     if (!directory || !*directory) {
         fail(error, error_size, "weight directory is required");
         return NULL;
+    }
+    struct stat status;
+    if (stat(directory, &status) == 0 && S_ISREG(status.st_mode)) {
+        const char *slash = strrchr(directory, '/');
+        const char *name = slash ? slash + 1 : directory;
+        if (!safetensors_name(name)) {
+            fail(error, error_size, "weight file must be a safetensors shard");
+            return NULL;
+        }
+        char *path = strdup(directory);
+        if (!path) {
+            fail(error, error_size, "out of memory resolving a weight shard");
+            return NULL;
+        }
+        h3_weight_store *store = open_store_from_paths(&path, 1, error,
+                                                       error_size);
+        free(path);
+        return store;
     }
     DIR *stream = opendir(directory);
     if (!stream) {
@@ -85,30 +130,8 @@ h3_weight_store *h3_weight_store_open(const char *directory,
         return NULL;
     }
     qsort(paths, count, sizeof(*paths), compare_paths);
-    h3_weight_store *store = calloc(1, sizeof(*store));
-    if (!store) {
-        fail(error, error_size, "out of memory creating weight store");
-        free_paths(paths, count);
-        return NULL;
-    }
-    store->headers = calloc(count, sizeof(*store->headers));
-    if (!store->headers) {
-        fail(error, error_size, "out of memory allocating weight headers");
-        free(store);
-        free_paths(paths, count);
-        return NULL;
-    }
-    store->count = count;
-    for (size_t index = 0; index < count; index++) {
-        char detail[384];
-        if (!h3_st_read_header(paths[index], &store->headers[index], detail,
-                               sizeof(detail))) {
-            fail(error, error_size, "%s", detail);
-            free_paths(paths, count);
-            h3_weight_store_free(store);
-            return NULL;
-        }
-    }
+    h3_weight_store *store = open_store_from_paths(paths, count, error,
+                                                   error_size);
     free_paths(paths, count);
     return store;
 }
@@ -137,6 +160,15 @@ const h3_st_tensor *h3_weight_find(const h3_weight_store *store,
             if (header) *header = &store->headers[index];
             return tensor;
         }
+    }
+    return NULL;
+}
+
+const char *h3_weight_metadata(const h3_weight_store *store, const char *key) {
+    if (!store || !key) return NULL;
+    for (size_t index = 0; index < store->count; index++) {
+        const char *value = h3_st_metadata(&store->headers[index], key);
+        if (value) return value;
     }
     return NULL;
 }

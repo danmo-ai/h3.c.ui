@@ -17,7 +17,7 @@ use crate::state::AppState;
 #[derive(Debug, Default, Deserialize)]
 pub struct StartDownloadBody {
     pub source: Option<String>,
-    /// `fl2va` (text / first-last) · `ref2va` (references) · `all`
+    /// `fl2va` · `ref2va` · `turbo_lora` · `all`
     pub package: Option<String>,
 }
 
@@ -38,14 +38,22 @@ pub async fn start(
         .unwrap_or(DownloadPackage::Fl2va);
 
     cfg.download_source = source;
-    let repo = cfg.repo_for_source(source).to_string();
+    let repo = match package {
+        DownloadPackage::TurboLora => cfg.turbo_lora_repo_for_source(source).to_string(),
+        _ => cfg.repo_for_source(source).to_string(),
+    };
+    // Turbo LoRA is a separate hub; land the shard under model_dir/turbo_lora/.
+    let dest = match package {
+        DownloadPackage::TurboLora => cfg.model_dir.join("turbo_lora"),
+        _ => cfg.model_dir.clone(),
+    };
     cfg.save(&state.home)
         .map_err(|e| (axum::http::StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     *state.config.lock() = cfg.clone();
 
     let (task_id, _, _) = state
         .downloads
-        .start(source, repo.clone(), cfg.model_dir.clone(), package)
+        .start(source, repo.clone(), dest, package)
         .map_err(|e| (axum::http::StatusCode::CONFLICT, e))?;
     Ok(Json(json!({
         "task_id": task_id,

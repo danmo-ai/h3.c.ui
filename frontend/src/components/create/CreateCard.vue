@@ -1,21 +1,56 @@
 <script setup lang="ts">
+import { computed, ref } from 'vue';
 import { api } from '@/utils/api';
 
-defineProps<{
+const props = defineProps<{
   name: string;
   bytes?: number;
+  modified?: number | null;
 }>();
 
 const emit = defineEmits<{
   remove: [];
   open: [];
 }>();
+
+const videoRef = ref<HTMLVideoElement | null>(null);
+
+const src = computed(() => {
+  const base = api.outputFileUrl(props.name);
+  const withQuery = props.modified ? `${base}?v=${props.modified}` : base;
+  return `${withQuery}#t=0.1`;
+});
+
+function showPosterFrame() {
+  const v = videoRef.value;
+  if (!v) return;
+  // Seek past t=0 so Safari/WebKit paints a visible frame for the card.
+  if (Number.isFinite(v.duration) && v.duration > 0) {
+    const t = Math.min(0.1, Math.max(0.001, v.duration * 0.02));
+    if (Math.abs(v.currentTime - t) > 0.001) {
+      try {
+        v.currentTime = t;
+      } catch {
+        /* ignore seek failures on incomplete media */
+      }
+    }
+  }
+}
 </script>
 
 <template>
   <article class="h3-studio-card">
     <button type="button" class="h3-studio-card__media" @click="emit('open')">
-      <video :src="api.outputFileUrl(name)" muted preload="metadata" playsinline />
+      <video
+        ref="videoRef"
+        :src="src"
+        muted
+        preload="auto"
+        playsinline
+        @loadedmetadata="showPosterFrame"
+        @loadeddata="showPosterFrame"
+        @seeked="showPosterFrame"
+      />
       <span class="h3-studio-card__play" aria-hidden="true">▶</span>
     </button>
     <div class="h3-studio-card__footer">
@@ -51,6 +86,7 @@ const emit = defineEmits<{
   object-fit: cover;
   display: block;
   pointer-events: none;
+  background: #111;
 }
 
 .h3-studio-card__play {

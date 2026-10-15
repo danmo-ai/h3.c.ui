@@ -1,15 +1,18 @@
 export type DownloadSourceId = 'huggingface' | 'hf_mirror' | 'modelscope';
-export type DownloadPackageId = 'fl2va' | 'ref2va' | 'all';
+export type DownloadPackageId = 'fl2va' | 'ref2va' | 'turbo_lora' | 'all';
 
 export type ModelStatus = {
   model_dir: string;
   fl2va_ready: boolean;
   ref2va_ready: boolean;
+  turbo_lora_ready?: boolean;
   missing_paths: string[];
   disk_bytes: number;
   loaded: boolean;
   hf_repo: string;
   modelscope_repo?: string;
+  turbo_lora_hf_repo?: string;
+  turbo_lora_modelscope_repo?: string;
   download_source?: DownloadSourceId;
   sources?: Array<{ id: DownloadSourceId; repo: string; endpoint?: string | null }>;
   model?: unknown;
@@ -37,6 +40,8 @@ export type GenerateBody = {
   dit_layers: number;
   core_reuse: number;
   token_reduction: boolean;
+  veda: boolean;
+  turbo_lora: boolean;
   ssd_streaming: boolean;
   use_int8_row_fc2: boolean;
   use_reference_rope: boolean;
@@ -171,9 +176,9 @@ export const api = {
   getTask: (taskId: string) => json<TaskSnapshot>(`/api/tasks/${taskId}`),
   listFailedTasks: () => json<{ tasks: TaskSnapshot[] }>('/api/tasks/failed'),
   listOutputs: () =>
-    json<{ outputs: Array<{ name: string; path: string; bytes: number; modified?: number }> }>(
-      '/api/outputs',
-    ),
+    json<{
+      outputs: Array<{ name: string; path: string; bytes: number; modified?: number }>;
+    }>('/api/outputs'),
   deleteOutput: (name: string) =>
     json<{ ok: boolean }>(`/api/outputs/${encodeURIComponent(name)}`, { method: 'DELETE' }),
   outputFileUrl: (name: string) => `/api/outputs/${encodeURIComponent(name)}/file`,

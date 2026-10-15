@@ -32,6 +32,8 @@ static void usage(const char *program) {
         "      --layers N         DiT blocks: 50 exact, 45 fast, 40 aggressive\n"
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
+        "      --veda             Use Veda tile-sparse DiT attention\n"
+        "      --turbo-lora       Merge 8-step Turbo LoRA into DiT linears\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
@@ -234,6 +236,8 @@ int main(int argc, char **argv) {
            OPT_LAYERS,
            OPT_CORE_REUSE,
            OPT_TOKEN_REDUCTION,
+           OPT_VEDA,
+           OPT_TURBO_LORA,
            OPT_SSD_STREAMING,
            OPT_USE_INT8_ROW_FC2,
            OPT_USE_REFERENCE_ROPE,
@@ -267,6 +271,8 @@ int main(int argc, char **argv) {
         {"layers", required_argument, NULL, OPT_LAYERS},
         {"core-reuse", required_argument, NULL, OPT_CORE_REUSE},
         {"token-reduction", no_argument, NULL, OPT_TOKEN_REDUCTION},
+        {"veda", no_argument, NULL, OPT_VEDA},
+        {"turbo-lora", no_argument, NULL, OPT_TURBO_LORA},
         {"ssd-streaming", no_argument, NULL, OPT_SSD_STREAMING},
         {"use-int8-row-fc2", no_argument, NULL, OPT_USE_INT8_ROW_FC2},
         {"use-reference-rope", no_argument, NULL, OPT_USE_REFERENCE_ROPE},
@@ -319,6 +325,7 @@ int main(int argc, char **argv) {
     int info = 0;
     int frames_given = 0;
     int seconds_given = 0;
+    int steps_given = 0;
     int seed_given = 0;
     int option;
     while ((option = getopt_long(argc, argv, "d:p:o:h", options, NULL)) != -1) {
@@ -343,7 +350,10 @@ int main(int argc, char **argv) {
                 params.frames = frames_from_seconds(optarg);
                 seconds_given = 1;
                 break;
-            case OPT_STEPS: params.steps = parse_int(optarg, "steps"); break;
+            case OPT_STEPS:
+                params.steps = parse_int(optarg, "steps");
+                steps_given = 1;
+                break;
             case OPT_REUSE:
                 params.denoise_reuse = parse_int(optarg, "reuse");
                 break;
@@ -354,6 +364,8 @@ int main(int argc, char **argv) {
                 params.core_reuse = parse_int(optarg, "core reuse");
                 break;
             case OPT_TOKEN_REDUCTION: params.token_reduction = 1; break;
+            case OPT_VEDA: params.veda = 1; break;
+            case OPT_TURBO_LORA: params.turbo_lora = 1; break;
             case OPT_SSD_STREAMING: params.ssd_streaming = 1; break;
             case OPT_USE_INT8_ROW_FC2:
                 params.use_int8_row_fc2 = 1;
@@ -470,6 +482,16 @@ int main(int argc, char **argv) {
     }
     if (frames_given && seconds_given) {
         fprintf(stderr, "h3: --seconds and --frames are mutually exclusive\n");
+        return 2;
+    }
+    if (params.turbo_lora && !steps_given)
+        params.steps = H3_TURBO_LORA_STEPS;
+    if (params.veda && params.token_reduction) {
+        fprintf(stderr, "h3: --veda cannot be combined with --token-reduction\n");
+        return 2;
+    }
+    if (params.turbo_lora && params.ssd_streaming) {
+        fprintf(stderr, "h3: --turbo-lora cannot be combined with --ssd-streaming\n");
         return 2;
     }
     if (prompt && params.steps >= 2 && params.steps <= 7 &&
