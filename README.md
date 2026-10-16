@@ -17,6 +17,7 @@ Product name: **H3.UI**. Engine CLI stays `./h3` (same lineage as upstream). Con
 | **Install** | [GitHub Releases](https://github.com/danmo-ai/h3.c.ui/releases/latest) · `H3.UI_*_aarch64.dmg` |
 | **Upstream engine** | [antirez/h3.c](https://github.com/antirez/h3.c) — Metal CLI, presets, kernels |
 | **Engine deep-dive** | [ENGINE.md](ENGINE.md) (CLI flags carried from upstream + fork additions) |
+| **Perf port notes** | [docs/PERF_PORT.md](docs/PERF_PORT.md) (Flash / Veda / Morton A/B on M5) |
 | **UI / API layout** | [UI.md](UI.md) |
 | **Sibling design system** | [dq-ui](https://github.com/danmo-ai/dq-ui) |
 
@@ -51,15 +52,22 @@ What **H3.UI / h3.c.ui** adds on top of the upstream CLI-only tree:
 | **Local API** | Rust `h3-api` (axum) over FFI — REST + SSE, not shelling out to `./h3` |
 | **Control plane** | `~/.h3-ui/` config, uploads, outputs, download state |
 
-### Engine additions (also exposed in CLI)
+### Engine additions (also exposed in CLI / env)
 | Extension | Detail |
 |-----------|--------|
-| **Turbo LoRA** | Optional 8-step adapter (`larryvrh/MiniMax-H3-Turbo-Lora`, ~780 MiB); Create toggle + `./h3` flag |
-| **Veda attention** | Extra attention path; cannot combine with token reduction |
+| **Turbo LoRA** | Optional 8-step adapter (`larryvrh/MiniMax-H3-Turbo-Lora`, ~780 MiB); Create + `./h3 --turbo-lora` |
+| **Veda sparse attention** | Tile-sparse SDPA (`--veda` / `!veda`); local keep-ratio plan or `H3_VEDA_PLAN`; **mutex** with token reduction |
+| **FlashAttention (opt-in)** | Streamed BF16 / int8 head-major SDPA via `H3_FORCE_FLASH_ATTN=1` [`H3_FORCE_INT8_FLASH_ATTN=1`]; not default yet (slower than MPSGraph on widescreen A/B) |
+| **Long-seq Morton tiles** | TensorOps linear schedule chunks past 2 048 rows (no 3 072 cap) for widescreen shapes |
+| **Int8 MLP weight cache** | `H3_INT8_CACHE=1` [`H3_INT8_CACHE_DIR`] persists runtime-quantized FC weights across launches |
+| **Module profile** | `H3_PROFILE=1` prints encode-side shares (`qkv` / `attn` / `attn_out` / `mlp`) |
+
+Mutex pairs (engine rejects both on): **Veda ↔ token reduction**, **Turbo LoRA ↔ SSD streaming**. Create studio exposes each pair as a pick-one dropdown. Numbers and enable flags: [docs/PERF_PORT.md](docs/PERF_PORT.md).
 
 ### Ops & UX (not in upstream CLI)
 | Extension | Detail |
 |-----------|--------|
+| **Mutex Create controls** | Attention path (off / token reduction / Veda) · Residence (off / Turbo LoRA / SSD streaming) |
 | **Split model packs** | Download FL2VA · Ref2VA · Turbo LoRA separately (ModelScope / HF Mirror / Hugging Face) |
 | **Resume / verify** | HTTP Range resume + SHA-256; cancel keeps progress |
 | **Media upload** | First/last frames & Ref2VA refs as real file uploads (no path paste) |

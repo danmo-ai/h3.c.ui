@@ -17,6 +17,7 @@ Language: [English](README.md) | **中文**
 | **安装** | [GitHub Releases](https://github.com/danmo-ai/h3.c.ui/releases/latest) · `H3.UI_*_aarch64.dmg` |
 | **上游引擎** | [antirez/h3.c](https://github.com/antirez/h3.c) — Metal CLI、预设、内核 |
 | **引擎详解** | [ENGINE.md](ENGINE.md)（上游 CLI 标志 + 本仓库增量） |
+| **性能移植笔记** | [docs/PERF_PORT.md](docs/PERF_PORT.md)（Flash / Veda / Morton 在 M5 上的 A/B） |
 | **UI / API 结构** | [UI.md](UI.md) |
 | **设计系统** | [dq-ui](https://github.com/danmo-ai/dq-ui) |
 
@@ -51,15 +52,22 @@ Language: [English](README.md) | **中文**
 | **本地 API** | Rust `h3-api`（axum）经 FFI 调用引擎 — REST + SSE，不是再起 `./h3` 子进程 |
 | **控制面** | `~/.h3-ui/` 配置、上传、输出、下载状态 |
 
-### 引擎增量（CLI 同样可用）
+### 引擎增量（CLI / 环境变量同样可用）
 | 扩展 | 说明 |
 |------|------|
-| **Turbo LoRA** | 可选 8 步适配器（`larryvrh/MiniMax-H3-Turbo-Lora`，约 780 MiB）；创作开关 + `./h3` 标志 |
-| **Veda 注意力** | 额外注意力路径；不可与 token reduction 同开 |
+| **Turbo LoRA** | 可选 8 步适配器（`larryvrh/MiniMax-H3-Turbo-Lora`，约 780 MiB）；创作页 + `./h3 --turbo-lora` |
+| **Veda 稀疏注意力** | Tile-sparse SDPA（`--veda` / `!veda`）；本地 keep-ratio 计划或 `H3_VEDA_PLAN`；与 token reduction **互斥** |
+| **FlashAttention（可选）** | 流式 BF16 / int8 head-major SDPA：`H3_FORCE_FLASH_ATTN=1`〔`H3_FORCE_INT8_FLASH_ATTN=1`〕；默认仍关（宽屏 A/B 慢于 MPSGraph） |
+| **长序列 Morton 分块** | TensorOps 线性日程对 >2 048 行自动分块（不再卡在 3 072），适配宽屏 |
+| **Int8 MLP 权重缓存** | `H3_INT8_CACHE=1`〔`H3_INT8_CACHE_DIR`〕跨进程保留运行时量化的 FC 权重 |
+| **模块级 profile** | `H3_PROFILE=1` 打印 encode 侧占比（`qkv` / `attn` / `attn_out` / `mlp`） |
+
+互斥对（引擎拒绝同时开启）：**Veda ↔ token reduction**、**Turbo LoRA ↔ SSD streaming**。创作页每对做成三选一下拉。数据与开关说明见 [docs/PERF_PORT.md](docs/PERF_PORT.md)。
 
 ### 运维与体验（上游 CLI 没有）
 | 扩展 | 说明 |
 |------|------|
+| **互斥创作控件** | 注意力路径（关 / token reduction / Veda）· 驻留模式（关 / Turbo LoRA / SSD streaming） |
 | **分包下载** | FL2VA · Ref2VA · Turbo LoRA 分开拉（魔搭 / HF 镜像 / Hugging Face） |
 | **续传 / 校验** | HTTP Range 断点续传 + SHA-256；取消保留进度 |
 | **媒体上传** | 首末帧与 Ref2VA 参考为真文件上传（不是手填路径） |
