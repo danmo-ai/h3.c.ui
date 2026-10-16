@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from 'vue';
+import { computed, onMounted, onUnmounted, ref } from 'vue';
 import { useI18n } from 'vue-i18n';
 import { api, type ModelStatus } from '@/utils/api';
 import { getItem, setItem } from '@/utils/storage';
@@ -22,6 +22,7 @@ const composerBusy = ref(false);
 const composerRef = ref<{ closeEs?: () => void } | null>(null);
 const lightboxName = ref<string | null>(null);
 const lightboxOpen = ref(false);
+const outputNames = computed(() => outputs.value.map((o) => o.name));
 
 async function refreshStatus() {
   status.value = await api.modelStatus();
@@ -126,7 +127,11 @@ onUnmounted(() => {
     </ComposerDrawer>
 
     <FailedTasksDrawer v-model:open="failedOpen" />
-    <MediaLightbox v-model:open="lightboxOpen" :name="lightboxName" />
+    <MediaLightbox
+      v-model:open="lightboxOpen"
+      v-model:name="lightboxName"
+      :names="outputNames"
+    />
   </div>
 </template>
 

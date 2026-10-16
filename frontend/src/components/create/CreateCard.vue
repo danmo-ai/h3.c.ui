@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
+import { useI18n } from 'vue-i18n';
 import { api } from '@/utils/api';
 
 const props = defineProps<{
@@ -13,6 +14,7 @@ const emit = defineEmits<{
   open: [];
 }>();
 
+const { t } = useI18n();
 const videoRef = ref<HTMLVideoElement | null>(null);
 
 const src = computed(() => {
@@ -55,7 +57,7 @@ function showPosterFrame() {
     </button>
     <div class="h3-studio-card__footer">
       <div class="h3-studio-card__name" :title="name">{{ name }}</div>
-      <DqButton size="sm" variant="ghost" @click="emit('remove')">Delete</DqButton>
+      <DqButton size="sm" variant="ghost" @click="emit('remove')">{{ t('create.delete') }}</DqButton>
     </div>
   </article>
 </template>
