@@ -81,12 +81,53 @@ const references = ref<RefRow[]>([]);
 const task = ref<TaskSnapshot | null>(null);
 let es: EventSource | null = null;
 
+type AttentionAccel = 'off' | 'token_reduction' | 'veda';
+type MemoryMode = 'off' | 'turbo_lora' | 'ssd_streaming';
+
+/** Mutually exclusive attention accelerators — engine rejects veda+token_reduction. */
+const attentionAccel = computed<AttentionAccel>({
+  get() {
+    if (form.veda) return 'veda';
+    if (form.token_reduction) return 'token_reduction';
+    return 'off';
+  },
+  set(value) {
+    form.veda = value === 'veda';
+    form.token_reduction = value === 'token_reduction';
+  },
+});
+
+/** Mutually exclusive residency / schedule modes — engine rejects turbo+ssd. */
+const memoryMode = computed<MemoryMode>({
+  get() {
+    if (form.turbo_lora) return 'turbo_lora';
+    if (form.ssd_streaming) return 'ssd_streaming';
+    return 'off';
+  },
+  set(value) {
+    form.turbo_lora = value === 'turbo_lora';
+    form.ssd_streaming = value === 'ssd_streaming';
+  },
+});
+
+const attentionAccelOptions = computed(() =>
+  [
+    { value: 'off' as const, label: t('create.accelOff') },
+    { value: 'token_reduction' as const, label: t('create.sw.tokenReduction') },
+    { value: 'veda' as const, label: t('create.sw.veda') },
+  ] as const,
+);
+
+const memoryModeOptions = computed(() =>
+  [
+    { value: 'off' as const, label: t('create.accelOff') },
+    { value: 'turbo_lora' as const, label: t('create.sw.turboLora') },
+    { value: 'ssd_streaming' as const, label: t('create.sw.ssdStreaming') },
+  ] as const,
+);
+
 const speedSwitches = computed(() =>
   [
-    { key: 'token_reduction' as const, label: t('create.sw.tokenReduction') },
-    { key: 'veda' as const, label: t('create.sw.veda') },
-    { key: 'turbo_lora' as const, label: t('create.sw.turboLora') },
-    { key: 'ssd_streaming' as const, label: t('create.sw.ssdStreaming') },
     { key: 'use_int8_row_fc2' as const, label: t('create.sw.int8RowFc2') },
     { key: 'use_reference_rope' as const, label: t('create.sw.referenceRope') },
   ] as const,
@@ -122,12 +163,9 @@ const busy = computed(
 
 watch(busy, (v) => emit('update:busy', v), { immediate: true });
 
-watch(
-  () => form.turbo_lora,
-  (on) => {
-    if (on && form.steps === 20) form.steps = 8;
-  },
-);
+watch(memoryMode, (mode) => {
+  if (mode === 'turbo_lora' && form.steps === 20) form.steps = 8;
+});
 
 const canGenerate = computed(() => {
   if (!props.status?.fl2va_ready) return false;
@@ -238,14 +276,6 @@ function buildBody(): GenerateBody {
 
 async function generate() {
   try {
-    if (form.veda && form.token_reduction) {
-      toast.error('Veda cannot be combined with token reduction');
-      return;
-    }
-    if (form.turbo_lora && form.ssd_streaming) {
-      toast.error('Turbo LoRA cannot be combined with SSD streaming');
-      return;
-    }
     if (form.turbo_lora && props.status && props.status.turbo_lora_ready === false) {
       toast.error(t('create.turboLoraMissing'));
       return;
@@ -482,7 +512,28 @@ defineExpose({ closeEs });
           </div>
 
           <div class="h3-composer__subsection">{{ t('create.sectionSpeed') }}</div>
+          <p class="h3-composer__hint">{{ t('create.mutexHint') }}</p>
           <div class="h3-composer__prefs">
+            <DqPrefRow :label="t('create.attentionAccel')">
+              <DqSelect v-model="attentionAccel" size="sm" class="h3-composer__mutex-select">
+                <DqOption
+                  v-for="opt in attentionAccelOptions"
+                  :key="opt.value"
+                  :value="opt.value"
+                  :label="opt.label"
+                />
+              </DqSelect>
+            </DqPrefRow>
+            <DqPrefRow :label="t('create.memoryMode')">
+              <DqSelect v-model="memoryMode" size="sm" class="h3-composer__mutex-select">
+                <DqOption
+                  v-for="opt in memoryModeOptions"
+                  :key="opt.value"
+                  :value="opt.value"
+                  :label="opt.label"
+                />
+              </DqSelect>
+            </DqPrefRow>
             <DqPrefRow v-for="item in speedSwitches" :key="item.key" :label="item.label">
               <DqSwitch v-model="form[item.key]" size="sm" />
             </DqPrefRow>
@@ -706,6 +757,18 @@ defineExpose({ closeEs });
   font-weight: 600;
   opacity: 0.5;
   margin-top: 4px;
+}
+
+.h3-composer__hint {
+  margin: -2px 0 0;
+  font-size: var(--dq-font-size-caption, 12px);
+  line-height: 1.4;
+  opacity: 0.55;
+}
+
+.h3-composer__mutex-select {
+  min-width: 168px;
+  max-width: 220px;
 }
 
 .h3-composer__live {

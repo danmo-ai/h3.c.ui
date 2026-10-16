@@ -565,9 +565,18 @@ attention-output projections at sequence lengths up to 2,048. The compact
 Morton schedule routes Q/K/V directly into head-major attention inputs, avoids
 three MPSGraph input transposes, and is byte-identical to the portable path. It
 improves a complete 512x512 50-block forward by about 2% across repeated IT/US
-M5 Max runs. For 2,049-3,072 rows, including 864x480, two row-offset Morton
-dispatches preserve the efficient tile geometry and improve the complete
-forward by about 2% in balanced runs. Still larger sequences stay on MPSGraph.
+M5 Max runs. For sequences above 2,048 rows the Morton path now chunks into
+2,048-row tiles with no 3,072-row upper cap, so long widescreen shapes keep the
+TensorOps linear schedule. Streamed FlashAttention
+(`h3_flash_attn_bf16_head_major` / optional int8) is available for head-major
+SDPA via `H3_FORCE_FLASH_ATTN=1` (and `H3_FORCE_INT8_FLASH_ATTN=1`); it is not
+the default yet because the current per-row kernel is still slower than
+MPSGraph on M5 Max widescreen. `--veda` builds a local tile-sparse plan
+(default keep-ratio 0.10, tile 128) or loads `H3_VEDA_PLAN` and runs
+`h3_sparse_attn_bf16_head_major`.
+`H3_PROFILE=1` also prints encode-side module shares (`qkv` / `attn` / `attn_out`
+/ `mlp`). Set `H3_INT8_CACHE=1` (optional `H3_INT8_CACHE_DIR`) to persist
+runtime-quantized int8 MLP weights across process launches.
 `H3_NAX=0` disables TensorOps for exact A/B diagnosis. The selection is guarded
 at runtime and falls back to the unchanged portable library if compilation is
 unavailable.

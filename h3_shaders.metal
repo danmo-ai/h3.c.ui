@@ -4355,3 +4355,367 @@ kernel void h3_silu_mul_bf16(device const ushort *gate [[buffer(0)]],
     float other = h3_bf16_to_f32(up[gid]);
     output[gid] = h3_f32_to_bf16(value / (1.0f + exp(-value)) * other);
 }
+
+/* FlashAttention-style dense SDPA for long sequences. One (query row, head)
+ * per threadgroup streams key/value blocks so threadgroup memory stays O(Bc)
+ * instead of O(sequence). Layout is head-major [heads, sequence, head_dim]. */
+struct flash_attn_args {
+    uint sequence;
+    uint heads;
+    uint head_dim;
+    uint block_size;
+    float scale;
+};
+
+kernel void h3_flash_attn_bf16_head_major(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant flash_attn_args &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    constexpr uint HEAD_DIM = 128;
+    constexpr uint BLOCK = 64;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    uint query_row = group.x;
+    uint head = group.y;
+    if (query_row >= args.sequence || head >= args.heads ||
+        args.head_dim != HEAD_DIM || threads < HEAD_DIM) return;
+
+    threadgroup float shared_query[HEAD_DIM];
+    threadgroup float reductions[HEAD_DIM];
+    threadgroup float out_acc[HEAD_DIM];
+    threadgroup float scores[BLOCK];
+
+    uint q_base = (head * args.sequence + query_row) * HEAD_DIM;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        shared_query[d] = h3_bf16_to_f32(query[q_base + d]) * args.scale;
+    if (tid < HEAD_DIM) out_acc[tid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    uint block_size = args.block_size ? args.block_size : BLOCK;
+    if (block_size > BLOCK) block_size = BLOCK;
+
+    for (uint key_begin = 0; key_begin < args.sequence; key_begin += block_size) {
+        uint key_count = min(block_size, args.sequence - key_begin);
+
+        float local_max = -INFINITY;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            uint key_row = key_begin + offset;
+            uint k_base = (head * args.sequence + key_row) * HEAD_DIM;
+            float dot = 0.0f;
+            for (uint d = 0; d < HEAD_DIM; d++)
+                dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]),
+                          dot);
+            scores[offset] = dot;
+            local_max = max(local_max, dot);
+        }
+        reductions[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride)
+                reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_max = reductions[0];
+        float new_max = max(running_max, block_max);
+        float rescale = running_max > -INFINITY ?
+            exp(running_max - new_max) : 0.0f;
+
+        float local_sum = 0.0f;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            float probability = exp(scores[offset] - new_max);
+            scores[offset] = probability;
+            local_sum += probability;
+        }
+        reductions[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride) reductions[tid] += reductions[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_sum = reductions[0];
+
+        for (uint d = tid; d < HEAD_DIM; d += threads) {
+            float acc = out_acc[d] * rescale;
+            for (uint offset = 0; offset < key_count; offset++) {
+                uint v_index = (head * args.sequence + key_begin + offset) *
+                    HEAD_DIM + d;
+                acc = fma(scores[offset], h3_bf16_to_f32(value[v_index]), acc);
+            }
+            out_acc[d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        running_sum = running_sum * rescale + block_sum;
+        running_max = new_max;
+    }
+
+    float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        output[q_base + d] = h3_f32_to_bf16(out_acc[d] * inverse);
+}
+
+/* Online int8 FlashAttention: row-group scales on Q/K (group=32), row-wise
+ * affine V kept in BF16. Matches the Draw Things / ccv int8 attention shape. */
+struct flash_attn_int8_args {
+    uint sequence;
+    uint heads;
+    uint head_dim;
+    uint block_size;
+    uint group_size;
+    float scale;
+};
+
+kernel void h3_flash_attn_int8_head_major(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        constant flash_attn_int8_args &args [[buffer(4)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    constexpr uint HEAD_DIM = 128;
+    constexpr uint BLOCK = 64;
+    constexpr uint GROUP = 32;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    uint query_row = group.x;
+    uint head = group.y;
+    if (query_row >= args.sequence || head >= args.heads ||
+        args.head_dim != HEAD_DIM || threads < HEAD_DIM) return;
+
+    uint group_size = args.group_size ? args.group_size : GROUP;
+    if (group_size == 0 || HEAD_DIM % group_size) group_size = GROUP;
+    uint groups = HEAD_DIM / group_size;
+
+    threadgroup float q_scales[HEAD_DIM / GROUP];
+    threadgroup char q_int8[HEAD_DIM];
+    threadgroup float reductions[HEAD_DIM];
+    threadgroup float out_acc[HEAD_DIM];
+    threadgroup float shared_query_f[HEAD_DIM];
+    threadgroup float scores[BLOCK];
+
+    uint q_base = (head * args.sequence + query_row) * HEAD_DIM;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        shared_query_f[d] = h3_bf16_to_f32(query[q_base + d]) * args.scale;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint g = tid; g < groups; g += threads) {
+        float abs_max = 0.0f;
+        uint base = g * group_size;
+        for (uint d = 0; d < group_size; d++)
+            abs_max = max(abs_max, fabs(shared_query_f[base + d]));
+        float scale = abs_max > 0.0f ? abs_max / 127.0f : 1.0f;
+        q_scales[g] = scale;
+        float inv = 1.0f / scale;
+        for (uint d = 0; d < group_size; d++) {
+            float q = shared_query_f[base + d] * inv;
+            q = max(-127.0f, min(127.0f, round(q)));
+            q_int8[base + d] = char(q);
+        }
+    }
+    if (tid < HEAD_DIM) out_acc[tid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    uint block_size = args.block_size ? args.block_size : BLOCK;
+    if (block_size > BLOCK) block_size = BLOCK;
+
+    for (uint key_begin = 0; key_begin < args.sequence; key_begin += block_size) {
+        uint key_count = min(block_size, args.sequence - key_begin);
+        float local_max = -INFINITY;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            uint key_row = key_begin + offset;
+            uint k_base = (head * args.sequence + key_row) * HEAD_DIM;
+            float dot = 0.0f;
+            for (uint g = 0; g < groups; g++) {
+                float abs_max = 0.0f;
+                uint base = g * group_size;
+                float k_vals[GROUP];
+                for (uint d = 0; d < group_size; d++) {
+                    k_vals[d] = h3_bf16_to_f32(key[k_base + base + d]);
+                    abs_max = max(abs_max, fabs(k_vals[d]));
+                }
+                float k_scale = abs_max > 0.0f ? abs_max / 127.0f : 1.0f;
+                float inv = 1.0f / k_scale;
+                int32_t acc = 0;
+                for (uint d = 0; d < group_size; d++) {
+                    float kq = k_vals[d] * inv;
+                    kq = max(-127.0f, min(127.0f, round(kq)));
+                    acc += int(q_int8[base + d]) * int(kq);
+                }
+                dot = fma(float(acc), q_scales[g] * k_scale, dot);
+            }
+            scores[offset] = dot;
+            local_max = max(local_max, dot);
+        }
+        reductions[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride)
+                reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_max = reductions[0];
+        float new_max = max(running_max, block_max);
+        float rescale = running_max > -INFINITY ?
+            exp(running_max - new_max) : 0.0f;
+
+        float local_sum = 0.0f;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            float probability = exp(scores[offset] - new_max);
+            scores[offset] = probability;
+            local_sum += probability;
+        }
+        reductions[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride) reductions[tid] += reductions[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_sum = reductions[0];
+
+        for (uint d = tid; d < HEAD_DIM; d += threads) {
+            float acc = out_acc[d] * rescale;
+            for (uint offset = 0; offset < key_count; offset++) {
+                uint v_index = (head * args.sequence + key_begin + offset) *
+                    HEAD_DIM + d;
+                acc = fma(scores[offset], h3_bf16_to_f32(value[v_index]), acc);
+            }
+            out_acc[d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        running_sum = running_sum * rescale + block_sum;
+        running_max = new_max;
+    }
+
+    float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        output[q_base + d] = h3_f32_to_bf16(out_acc[d] * inverse);
+}
+
+/* Tile-sparse attention for Veda: CSR of kept (q_tile -> k_tile) pairs.
+ * Softmax is over the kept key tokens only (learned sparse approximation). */
+struct sparse_attn_args {
+    uint sequence;
+    uint heads;
+    uint head_dim;
+    uint tile_size;
+    uint q_tiles;
+    float scale;
+};
+
+kernel void h3_sparse_attn_bf16_head_major(
+        device const ushort *query [[buffer(0)]],
+        device const ushort *key [[buffer(1)]],
+        device const ushort *value [[buffer(2)]],
+        device ushort *output [[buffer(3)]],
+        device const uint *q_offsets [[buffer(4)]],
+        device const uint *k_tiles [[buffer(5)]],
+        constant sparse_attn_args &args [[buffer(6)]],
+        uint3 group [[threadgroup_position_in_grid]],
+        uint3 thread_position [[thread_position_in_threadgroup]],
+        uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    constexpr uint HEAD_DIM = 128;
+    constexpr uint MAX_TILE = 128;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    uint query_row = group.x;
+    uint head = group.y;
+    if (query_row >= args.sequence || head >= args.heads ||
+        args.head_dim != HEAD_DIM || !args.tile_size ||
+        threads < HEAD_DIM) return;
+
+    uint q_tile = query_row / args.tile_size;
+    if (q_tile >= args.q_tiles) return;
+    uint pair_begin = q_offsets[q_tile];
+    uint pair_end = q_offsets[q_tile + 1];
+    if (pair_begin >= pair_end) {
+        uint q_base = (head * args.sequence + query_row) * HEAD_DIM;
+        for (uint d = tid; d < HEAD_DIM; d += threads)
+            output[q_base + d] = 0;
+        return;
+    }
+
+    threadgroup float shared_query[HEAD_DIM];
+    threadgroup float reductions[HEAD_DIM];
+    threadgroup float out_acc[HEAD_DIM];
+    threadgroup float scores[MAX_TILE];
+    uint q_base = (head * args.sequence + query_row) * HEAD_DIM;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        shared_query[d] = h3_bf16_to_f32(query[q_base + d]) * args.scale;
+    if (tid < HEAD_DIM) out_acc[tid] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float running_max = -INFINITY;
+    float running_sum = 0.0f;
+    uint tile_size = min(args.tile_size, MAX_TILE);
+
+    for (uint pair = pair_begin; pair < pair_end; pair++) {
+        uint k_tile = k_tiles[pair];
+        uint key_begin = k_tile * tile_size;
+        if (key_begin >= args.sequence) continue;
+        uint key_count = min(tile_size, args.sequence - key_begin);
+
+        float local_max = -INFINITY;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            uint key_row = key_begin + offset;
+            uint k_base = (head * args.sequence + key_row) * HEAD_DIM;
+            float dot = 0.0f;
+            for (uint d = 0; d < HEAD_DIM; d++)
+                dot = fma(shared_query[d], h3_bf16_to_f32(key[k_base + d]),
+                          dot);
+            scores[offset] = dot;
+            local_max = max(local_max, dot);
+        }
+        reductions[tid] = local_max;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride)
+                reductions[tid] = max(reductions[tid], reductions[tid + stride]);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_max = reductions[0];
+        float new_max = max(running_max, block_max);
+        float rescale = running_max > -INFINITY ?
+            exp(running_max - new_max) : 0.0f;
+
+        float local_sum = 0.0f;
+        for (uint offset = tid; offset < key_count; offset += threads) {
+            float probability = exp(scores[offset] - new_max);
+            scores[offset] = probability;
+            local_sum += probability;
+        }
+        reductions[tid] = local_sum;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint stride = threads / 2; stride; stride >>= 1) {
+            if (tid < stride) reductions[tid] += reductions[tid + stride];
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        float block_sum = reductions[0];
+
+        for (uint d = tid; d < HEAD_DIM; d += threads) {
+            float acc = out_acc[d] * rescale;
+            for (uint offset = 0; offset < key_count; offset++) {
+                uint v_index = (head * args.sequence + key_begin + offset) *
+                    HEAD_DIM + d;
+                acc = fma(scores[offset], h3_bf16_to_f32(value[v_index]), acc);
+            }
+            out_acc[d] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        running_sum = running_sum * rescale + block_sum;
+        running_max = new_max;
+    }
+
+    float inverse = running_sum > 0.0f ? 1.0f / running_sum : 0.0f;
+    for (uint d = tid; d < HEAD_DIM; d += threads)
+        output[q_base + d] = h3_f32_to_bf16(out_acc[d] * inverse);
+}

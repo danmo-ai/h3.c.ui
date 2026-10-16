@@ -191,7 +191,8 @@ static void h3_gpu_profile_emit(H3GPU *gpu, NSString *phase,
         "h3 profile: %-24s %-14s wall=%8.3fs encode=%7.3fs "
         "wait=%8.3fs root-gpu=%7.3fs "
         "peak=%7.3fGiB alloc=%7.3fGiB submissions=%llu "
-        "direct=%llu linear=%llu conv=%llu attention=%llu\n",
+        "direct=%llu linear=%llu conv=%llu attention=%llu "
+        "flash=%llu sparse=%llu\n",
         label.UTF8String, phase.UTF8String, wall,
         value.command_encode_seconds - start.command_encode_seconds,
         value.command_wait_seconds - start.command_wait_seconds,
@@ -209,7 +210,11 @@ static void h3_gpu_profile_emit(H3GPU *gpu, NSString *phase,
         (unsigned long long)h3_gpu_counter_delta(value.mps_conv_dispatches,
                                                  start.mps_conv_dispatches),
         (unsigned long long)h3_gpu_counter_delta(value.mps_sdpa_dispatches,
-                                                 start.mps_sdpa_dispatches));
+                                                 start.mps_sdpa_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.flash_attn_dispatches,
+                                                 start.flash_attn_dispatches),
+        (unsigned long long)h3_gpu_counter_delta(value.sparse_attn_dispatches,
+                                                 start.sparse_attn_dispatches));
 }
 
 static void h3_gpu_set_error(H3GPU *gpu, NSString *format, ...) {
@@ -235,6 +240,11 @@ static int h3_gpu_require_elements(H3GPU *gpu, const h3_gpu_tensor *tensor,
     }
     return 1;
 }
+
+static int h3_gpu_require_bf16(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                               size_t elements, NSString *label);
+static int h3_gpu_require_i8(H3GPU *gpu, const h3_gpu_tensor *tensor,
+                             size_t elements, NSString *label);
 
 static id<MTLComputePipelineState> h3_gpu_pipeline(H3GPU *gpu, NSString *name) {
     id<MTLComputePipelineState> pipeline = gpu.pipelines[name];
@@ -463,6 +473,9 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             @"h3_token_expand_adaln_bf16",
             @"h3_euler_bf16", @"h3_silu_mul_bf16",
             @"h3_lora_merge_bf16",
+            @"h3_flash_attn_bf16_head_major",
+            @"h3_flash_attn_int8_head_major",
+            @"h3_sparse_attn_bf16_head_major",
             @"h3_weight_norm_f32", @"h3_add_scaled_f32",
             @"h3_alias_free_snake_f32", @"h3_snake1d_f32",
             @"h3_audio_qkv_split_f32", @"h3_audio_attention_pool_f32",
@@ -635,6 +648,11 @@ h3_gpu_tensor *h3_gpu_tensor_from_bf16(h3_gpu *gpu, const uint16_t *values,
 h3_gpu_tensor *h3_gpu_tensor_from_u32(h3_gpu *gpu, const uint32_t *values,
                                       size_t elements) {
     return h3_gpu_tensor_new(gpu, values, elements, sizeof(uint32_t), H3_GPU_U32);
+}
+
+h3_gpu_tensor *h3_gpu_tensor_from_i8(h3_gpu *gpu, const int8_t *values,
+                                     size_t elements) {
+    return h3_gpu_tensor_new(gpu, values, elements, sizeof(int8_t), H3_GPU_I8);
 }
 
 static h3_gpu_tensor *h3_gpu_tensor_load_file(h3_gpu *opaque, const char *path,
@@ -870,6 +888,22 @@ int h3_gpu_tensor_read_bf16(const h3_gpu_tensor *tensor, uint16_t *values,
     if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_BF16 ||
         elements > TENSOR(tensor).elements) return 0;
     memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(uint16_t));
+    return 1;
+}
+
+int h3_gpu_tensor_read_i8(const h3_gpu_tensor *tensor, int8_t *values,
+                          size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        elements > TENSOR(tensor).elements) return 0;
+    memcpy(values, TENSOR(tensor).buffer.contents, elements * sizeof(int8_t));
+    return 1;
+}
+
+int h3_gpu_tensor_write_i8(h3_gpu_tensor *tensor, const int8_t *values,
+                           size_t elements) {
+    if (!tensor || !values || TENSOR(tensor).dtype != H3_GPU_I8 ||
+        elements > TENSOR(tensor).elements) return 0;
+    memcpy(TENSOR(tensor).buffer.contents, values, elements * sizeof(int8_t));
     return 1;
 }
 
@@ -1629,13 +1663,202 @@ int h3_gpu_sdpa_causal_f32(h3_gpu *opaque, h3_gpu_tensor *output,
                        MPSDataTypeFloat32, 1, 0);
 }
 
+static int h3_gpu_flash_attn_prefer_long_sequence(uint32_t sequence) {
+    /* Streamed FlashAttention is wired for >3072-row shapes, but the current
+     * per-row BF16 kernel is still slower than MPSGraph on M5 Max widescreen
+     * (measured ~167s vs ~14s denoise at 1344x768/22f/2-step/35-layer). Keep
+     * it opt-in until a TensorOps Flash path lands. */
+    (void)sequence;
+    if (getenv("H3_DISABLE_FLASH_ATTN")) return 0;
+    return getenv("H3_FORCE_FLASH_ATTN") != NULL;
+}
+
+static int h3_gpu_flash_attn_prefer_int8(h3_gpu *opaque) {
+    /* Online int8 Flash is available but currently slower than the BF16
+     * streaming kernel without TensorOps QK/PV; opt in explicitly. */
+    (void)opaque;
+    if (getenv("H3_FORCE_BF16_FLASH_ATTN")) return 0;
+    return getenv("H3_FORCE_INT8_FLASH_ATTN") != NULL;
+}
+
+int h3_gpu_flash_attn_bf16_head_major(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (head_dim != 128 || !sequence || !heads ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, count, @"flash query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"flash key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"flash value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"flash output")) return 0;
+    typedef struct {
+        uint32_t sequence, heads, head_dim, block_size;
+        float scale;
+    } flash_args;
+    flash_args args = {sequence, heads, head_dim, 64u, scale};
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_flash_attn_bf16_head_major");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"flash attention pipeline unavailable");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    stats.flash_attn_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_flash_attn_int8_head_major(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (head_dim != 128 || !sequence || !heads ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, count, @"int8 flash query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"int8 flash key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"int8 flash value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"int8 flash output"))
+        return 0;
+    typedef struct {
+        uint32_t sequence, heads, head_dim, block_size, group_size;
+        float scale;
+    } flash_int8_args;
+    flash_int8_args args = {sequence, heads, head_dim, 64u, 32u, scale};
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_flash_attn_int8_head_major");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"int8 flash attention pipeline unavailable");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    stats.flash_attn_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_sparse_attn_bf16_head_major(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value,
+                     const h3_gpu_tensor *q_offsets,
+                     const h3_gpu_tensor *k_tiles,
+                     uint32_t sequence, uint32_t heads, uint32_t head_dim,
+                     uint32_t tile_size, uint32_t q_tiles, float scale) {
+    H3GPU *gpu = GPU(opaque);
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (head_dim != 128 || !sequence || !heads || !tile_size || !q_tiles ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, count, @"sparse query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"sparse key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"sparse value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"sparse output") ||
+        !h3_gpu_require_elements(gpu, q_offsets, (size_t)q_tiles + 1u,
+                                 @"sparse q_offsets") ||
+        TENSOR(q_offsets).dtype != H3_GPU_U32 ||
+        !h3_gpu_require_elements(gpu, k_tiles, 1, @"sparse k_tiles") ||
+        TENSOR(k_tiles).dtype != H3_GPU_U32) return 0;
+    typedef struct {
+        uint32_t sequence, heads, head_dim, tile_size, q_tiles;
+        float scale;
+    } sparse_args;
+    sparse_args args = {sequence, heads, head_dim, tile_size, q_tiles, scale};
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_sparse_attn_bf16_head_major");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"sparse attention pipeline unavailable");
+        return 0;
+    }
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBuffer:TENSOR(q_offsets).buffer offset:0 atIndex:4];
+        [encoder setBuffer:TENSOR(k_tiles).buffer offset:0 atIndex:5];
+        [encoder setBytes:&args length:sizeof(args) atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake(sequence, heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    stats.sparse_attn_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+static int h3_gpu_sdpa_bf16_routed(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale,
+                     int head_major_output) {
+    H3GPU *gpu = GPU(opaque);
+    int head_major_inputs = gpu.headMajorSDPAInputs && head_dim == 128;
+    if (head_major_inputs && head_major_output &&
+        h3_gpu_flash_attn_prefer_long_sequence(sequence)) {
+        gpu.headMajorSDPAInputs = NO;
+        if (h3_gpu_flash_attn_prefer_int8(opaque)) {
+            if (h3_gpu_flash_attn_int8_head_major(
+                    opaque, output, query, key, value, sequence, heads,
+                    head_dim, scale))
+                return 1;
+        } else if (h3_gpu_flash_attn_bf16_head_major(
+                       opaque, output, query, key, value, sequence, heads,
+                       head_dim, scale)) {
+            return 1;
+        }
+        /* Fall through to MPSGraph if flash dispatch failed. */
+        gpu.headMajorSDPAInputs = YES;
+    }
+    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
+                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
+                       head_major_output);
+}
+
 int h3_gpu_sdpa_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
-                       0);
+    return h3_gpu_sdpa_bf16_routed(opaque, output, query, key, value, sequence,
+                                   heads, head_dim, scale, 0);
 }
 
 int h3_gpu_sdpa_bf16_head_major_output(
@@ -1643,9 +1866,8 @@ int h3_gpu_sdpa_bf16_head_major_output(
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale) {
-    return h3_gpu_sdpa(opaque, output, query, key, value, 1, sequence, heads,
-                       head_dim, scale, H3_GPU_BF16, MPSDataTypeBFloat16, 0,
-                       1);
+    return h3_gpu_sdpa_bf16_routed(opaque, output, query, key, value, sequence,
+                                   heads, head_dim, scale, 1);
 }
 
 int h3_gpu_swiglu_f32(h3_gpu *opaque, h3_gpu_tensor *output,
@@ -2478,9 +2700,10 @@ int h3_gpu_linear_bf16(h3_gpu *opaque, h3_gpu_tensor *output,
         !h3_gpu_require_bf16(gpu, output, output_count, @"linear output") ||
         (bias && !h3_gpu_require_bf16(gpu, bias, output_dim, @"linear bias"))) return 0;
     const char *splitRowsValue = getenv("H3_NAX_SPLIT_ROWS");
-    BOOL autoSplitRows = gpu.tensorOpsEnabled && rows > 2048 && rows <= 3072 &&
-        (gpu.tensorOpsMode == 2 || gpu.tensorOpsMode == 3 ||
-         gpu.tensorOpsMode == 4);
+    /* Chunk long sequences into 2048-row Morton tiles (no 3072 upper cap). */
+    BOOL autoSplitRows = gpu.tensorOpsEnabled && rows > 2048 &&
+        (gpu.tensorOpsMode == 1 || gpu.tensorOpsMode == 2 ||
+         gpu.tensorOpsMode == 3 || gpu.tensorOpsMode == 4);
     BOOL splitRows = rows > 2048 &&
         (autoSplitRows || (splitRowsValue && *splitRowsValue));
     BOOL specializedRows = rows <= 2048 || splitRows;

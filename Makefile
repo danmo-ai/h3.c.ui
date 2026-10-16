@@ -9,7 +9,7 @@ FRAMEWORKS := -framework Foundation -framework Metal \
 LDLIBS := $(FRAMEWORKS) -licucore -lm
 
 LIB_C := h3.c h3_host.c h3_safetensors.c h3_weights.c h3_text_encoder.c \
-	h3_dit_schedule.c h3_dit.c
+	h3_dit_schedule.c h3_dit.c h3_veda.c
 
 LIB_C += h3_video_vae.c h3_video_encoder.c h3_audio_vae.c h3_ffmpeg.c \
 	h3_terminal.c h3_vision_encoder.c h3_multimodal.c
@@ -89,6 +89,9 @@ h3_semantic_dit_test: tests/test_semantic_dit.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_flash_attn_test: tests/test_flash_attn.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)

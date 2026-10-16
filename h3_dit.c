@@ -1,8 +1,10 @@
 #include "h3_dit.h"
 
 #include "h3_dit_schedule.h"
+#include "h3_veda.h"
 #include "h3_weights.h"
 
+#include <errno.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -10,6 +12,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 enum {
@@ -93,6 +96,13 @@ struct h3_dit {
     int fused_patch_pack;
     int token_reduction;
     int veda;
+    h3_veda_plan *veda_plan;
+    double profile_qkv_seconds;
+    double profile_sdpa_seconds;
+    double profile_attn_out_seconds;
+    double profile_mlp_seconds;
+    double profile_other_seconds;
+    uint64_t profile_block_count;
     h3_weight_store *lora_weights;
     const char *lora_key_prefix;
     const char *lora_a_suffix;
@@ -825,8 +835,143 @@ static void *read_stream_layer_thread(void *opaque) {
     return NULL;
 }
 
+static int int8_cache_enabled(void) {
+    const char *value = getenv("H3_INT8_CACHE");
+    return value && *value && strcmp(value, "0") != 0;
+}
+
+static int int8_cache_dir(char *path, size_t path_size) {
+    const char *env = getenv("H3_INT8_CACHE_DIR");
+    if (env && *env) {
+        snprintf(path, path_size, "%s", env);
+        return 1;
+    }
+    snprintf(path, path_size, ".h3_int8_cache");
+    return 1;
+}
+
+static int ensure_directory(const char *path) {
+    if (!path || !*path) return 0;
+    if (mkdir(path, 0755) == 0 || errno == EEXIST) return 1;
+    return 0;
+}
+
+static int int8_cache_file(char *path, size_t path_size, const char *kind,
+                           unsigned block_index, const char *part) {
+    char directory[512];
+    if (!int8_cache_dir(directory, sizeof(directory))) return 0;
+    if (!ensure_directory(directory)) return 0;
+    snprintf(path, path_size, "%s/%s_b%u_%s.bin", directory, kind,
+             block_index, part);
+    return 1;
+}
+
+static int write_tensor_blob(const char *path, const void *bytes,
+                             size_t byte_count) {
+    FILE *file = fopen(path, "wb");
+    if (!file) return 0;
+    int ok = fwrite(bytes, 1, byte_count, file) == byte_count;
+    fclose(file);
+    return ok;
+}
+
+static int read_tensor_blob(const char *path, void *bytes, size_t byte_count) {
+    FILE *file = fopen(path, "rb");
+    if (!file) return 0;
+    int ok = fread(bytes, 1, byte_count, file) == byte_count;
+    fclose(file);
+    return ok;
+}
+
+static int cache_store_pair(const char *kind, unsigned block,
+                            h3_gpu_tensor *i8, h3_gpu_tensor *scales,
+                            size_t i8_count, size_t scale_count) {
+    char i8_path[768];
+    char scale_path[768];
+    if (!int8_cache_file(i8_path, sizeof(i8_path), kind, block, "i8") ||
+        !int8_cache_file(scale_path, sizeof(scale_path), kind, block,
+                         "scales"))
+        return 0;
+    int8_t *i8_host = malloc(i8_count);
+    float *scale_host = malloc(scale_count * sizeof(float));
+    int ok = i8_host && scale_host &&
+             h3_gpu_tensor_read_i8(i8, i8_host, i8_count) &&
+             h3_gpu_tensor_read_f32(scales, scale_host, scale_count) &&
+             write_tensor_blob(i8_path, i8_host, i8_count) &&
+             write_tensor_blob(scale_path, scale_host,
+                               scale_count * sizeof(float));
+    free(i8_host);
+    free(scale_host);
+    return ok;
+}
+
+static int cache_load_pair(h3_gpu *gpu, const char *kind, unsigned block,
+                           h3_gpu_tensor **i8_out, h3_gpu_tensor **scales_out,
+                           size_t i8_count, size_t scale_count) {
+    char i8_path[768];
+    char scale_path[768];
+    char directory[512];
+    if (!int8_cache_dir(directory, sizeof(directory))) return 0;
+    snprintf(i8_path, sizeof(i8_path), "%s/%s_b%u_i8.bin", directory, kind,
+             block);
+    snprintf(scale_path, sizeof(scale_path), "%s/%s_b%u_scales.bin", directory,
+             kind, block);
+    int8_t *i8_host = malloc(i8_count);
+    float *scale_host = malloc(scale_count * sizeof(float));
+    if (!i8_host || !scale_host ||
+        !read_tensor_blob(i8_path, i8_host, i8_count) ||
+        !read_tensor_blob(scale_path, scale_host,
+                          scale_count * sizeof(float))) {
+        free(i8_host);
+        free(scale_host);
+        return 0;
+    }
+    h3_gpu_tensor *i8 = h3_gpu_tensor_from_i8(gpu, i8_host, i8_count);
+    h3_gpu_tensor *scales = h3_gpu_tensor_from_f32(gpu, scale_host,
+                                                   scale_count);
+    free(i8_host);
+    free(scale_host);
+    if (!i8 || !scales) {
+        h3_gpu_tensor_free(i8);
+        h3_gpu_tensor_free(scales);
+        return 0;
+    }
+    *i8_out = i8;
+    *scales_out = scales;
+    return 1;
+}
+
+static int try_load_cached_mlp(h3_dit *dit, h3_dit_block *block,
+                               unsigned block_index) {
+    h3_gpu_tensor *fc1_int8 = NULL, *fc1_scales = NULL;
+    h3_gpu_tensor *fc2_int8 = NULL, *fc2_scales = NULL;
+    if (!cache_load_pair(dit->gpu, "mlp_fc1", block_index, &fc1_int8,
+                         &fc1_scales, (size_t)FFN * 2 * HIDDEN, FFN * 2) ||
+        !cache_load_pair(dit->gpu, "mlp_fc2", block_index, &fc2_int8,
+                         &fc2_scales, (size_t)HIDDEN * FFN, HIDDEN)) {
+        h3_gpu_tensor_free(fc1_int8);
+        h3_gpu_tensor_free(fc1_scales);
+        h3_gpu_tensor_free(fc2_int8);
+        h3_gpu_tensor_free(fc2_scales);
+        return 0;
+    }
+    block->fc1_int8 = fc1_int8;
+    block->fc1_scales = fc1_scales;
+    block->fc2_int8 = fc2_int8;
+    block->fc2_scales = fc2_scales;
+    if (!dit->keep_bf16_mlp) {
+        free_tensor(&block->fc1);
+        free_tensor(&block->fc2);
+    }
+    return 1;
+}
+
 static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
+    unsigned block_index = (unsigned)(block - dit->blocks);
+    if (int8_cache_enabled() &&
+        try_load_cached_mlp(dit, block, block_index))
+        return 1;
     block->fc1_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)FFN * 2 * HIDDEN);
     block->fc1_scales = h3_gpu_tensor_new_f32(dit->gpu, FFN * 2);
@@ -848,6 +993,12 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    if (int8_cache_enabled()) {
+        cache_store_pair("mlp_fc1", block_index, block->fc1_int8,
+                         block->fc1_scales, (size_t)FFN * 2 * HIDDEN, FFN * 2);
+        cache_store_pair("mlp_fc2", block_index, block->fc2_int8,
+                         block->fc2_scales, (size_t)HIDDEN * FFN, HIDDEN);
+    }
     if (!dit->keep_bf16_mlp) {
         free_tensor(&block->fc1);
         free_tensor(&block->fc2);
@@ -857,6 +1008,14 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
 
 static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
+    unsigned block_index = (unsigned)(block - dit->blocks);
+    if (int8_cache_enabled() &&
+        cache_load_pair(dit->gpu, "qkv", block_index, &block->qkv_int8,
+                        &block->qkv_scales, (size_t)INNER * 3 * HIDDEN,
+                        INNER * 3)) {
+        if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
+        return 1;
+    }
     block->qkv_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)INNER * 3 * HIDDEN);
     block->qkv_scales = h3_gpu_tensor_new_f32(dit->gpu, INNER * 3);
@@ -871,12 +1030,23 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    if (int8_cache_enabled())
+        cache_store_pair("qkv", block_index, block->qkv_int8,
+                         block->qkv_scales, (size_t)INNER * 3 * HIDDEN,
+                         INNER * 3);
     if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
     return 1;
 }
 
 static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
                                         char *error, size_t error_size) {
+    unsigned block_index = (unsigned)(block - dit->blocks);
+    if (int8_cache_enabled() &&
+        cache_load_pair(dit->gpu, "attn_out", block_index, &block->out_int8,
+                        &block->out_scales, (size_t)HIDDEN * INNER, HIDDEN)) {
+        if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
+        return 1;
+    }
     block->out_int8 = h3_gpu_tensor_new_i8(
         dit->gpu, (size_t)HIDDEN * INNER);
     block->out_scales = h3_gpu_tensor_new_f32(dit->gpu, HIDDEN);
@@ -892,6 +1062,9 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
              h3_gpu_error(dit->gpu));
         return 0;
     }
+    if (int8_cache_enabled())
+        cache_store_pair("attn_out", block_index, block->out_int8,
+                         block->out_scales, (size_t)HIDDEN * INNER, HIDDEN);
     if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
     return 1;
 }
@@ -1792,10 +1965,35 @@ static h3_dit *load_dit(const char *weight_directory,
             !configure_lora_layout(dit, error, error_size)) goto failed;
         fprintf(stderr, "h3: merging Turbo LoRA from %s\n", turbo_lora_path);
     }
-    if (veda)
+    if (veda) {
+        const char *plan_path = getenv("H3_VEDA_PLAN");
+        float keep_ratio = 0.10f;
+        const char *keep_env = getenv("H3_VEDA_KEEP_RATIO");
+        if (keep_env && *keep_env) {
+            float parsed = strtof(keep_env, NULL);
+            if (parsed > 0.0f && parsed <= 1.0f) keep_ratio = parsed;
+        }
+        uint32_t tile_size = 128u;
+        const char *tile_env = getenv("H3_VEDA_TILE");
+        if (tile_env && *tile_env) {
+            unsigned long parsed = strtoul(tile_env, NULL, 10);
+            if (parsed >= 16ul && parsed <= 128ul) tile_size = (uint32_t)parsed;
+        }
+        if (plan_path && *plan_path)
+            dit->veda_plan = h3_veda_plan_load(
+                dit->gpu, plan_path, dit->sequence, error, error_size);
+        else
+            dit->veda_plan = h3_veda_plan_build_local(
+                dit->gpu, dit->sequence, tile_size, keep_ratio, error,
+                error_size);
+        if (!dit->veda_plan) goto failed;
         fprintf(stderr,
-                "h3: Veda selected; using dense SDPA until the tile-sparse "
-                "kernel is wired\n");
+                "h3: Veda tile-sparse attention on (%u tiles, %u pairs, "
+                "tile=%u)\n",
+                h3_veda_plan_q_tiles(dit->veda_plan),
+                h3_veda_plan_pairs(dit->veda_plan),
+                h3_veda_plan_tile_size(dit->veda_plan));
+    }
     dit->nax_mlp = dit->fused_mlp && h3_gpu_has_nax_mlp(dit->gpu);
     dit->int8_mlp = !dit->ssd_streaming && dit->fused_mlp &&
                     !use_slower_bf16_mlp &&
@@ -2066,10 +2264,16 @@ static int run_block(h3_dit *dit, unsigned index, int step,
 #define OP(call, label) do {                                                    \
     if (!gpu_op(dit, (call), error, error_size, label)) return 0;               \
 } while (0)
+    int profile_modules = getenv("H3_PROFILE") != NULL;
+    double profile_mark = profile_modules ? stream_now() : 0.0;
     if (!attention_adaln_ready)
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
+    if (profile_modules) {
+        dit->profile_other_seconds += stream_now() - profile_mark;
+        profile_mark = stream_now();
+    }
     if (dit->int8_qkv && !getenv("H3_DISABLE_INT8_QKV")) {
         OP(h3_gpu_grouped_qkv_linear_rope_int8(
             dit->gpu, dit->query, dit->key, dit->value,
@@ -2089,23 +2293,41 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             rope_cos, rope_sin, rows, HIDDEN, HEADS, HEAD_DIM, ROPE_HALF,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
+    if (profile_modules) {
+        dit->profile_qkv_seconds += stream_now() - profile_mark;
+        profile_mark = stream_now();
+    }
     int int8_attention_output = dit->int8_attention_out &&
         !getenv("H3_DISABLE_INT8_ATTENTION_OUT");
     int head_major_attention_output = int8_attention_output &&
         !dit->use_slower_row_major_attention_output &&
         !dit->use_slower_uncached_int8_scales &&
         !getenv("H3_DISABLE_HEAD_MAJOR_ATTENTION_OUTPUT");
-    if (head_major_attention_output)
+    if (dit->veda && dit->veda_plan && head_major_attention_output) {
+        OP(h3_gpu_sparse_attn_bf16_head_major(
+            dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
+            h3_veda_plan_q_offsets(dit->veda_plan),
+            h3_veda_plan_k_tiles(dit->veda_plan),
+            rows, HEADS, HEAD_DIM,
+            h3_veda_plan_tile_size(dit->veda_plan),
+            h3_veda_plan_q_tiles(dit->veda_plan),
+            1.0f / sqrtf((float)HEAD_DIM)),
+           "DiT Veda sparse attention");
+    } else if (head_major_attention_output)
         OP(h3_gpu_sdpa_bf16_head_major_output(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-           dit->veda ? "DiT Veda head-major attention" :
            "DiT head-major full attention");
     else
         OP(h3_gpu_sdpa_bf16(
             dit->gpu, dit->attention_heads, dit->query, dit->key, dit->value,
             rows, HEADS, HEAD_DIM, 1.0f / sqrtf((float)HEAD_DIM)),
-           dit->veda ? "DiT Veda attention" : "DiT full attention");
+           dit->veda ? "DiT Veda dense fallback attention" :
+           "DiT full attention");
+    if (profile_modules) {
+        dit->profile_sdpa_seconds += stream_now() - profile_mark;
+        profile_mark = stream_now();
+    }
     if (int8_attention_output) {
         if (head_major_attention_output)
             OP(h3_gpu_linear_int8_head_major_bf16(
@@ -2124,6 +2346,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, dit->attention_output,
             dit->attention_heads, weight->out, NULL, rows, INNER, HIDDEN),
            "DiT attention output");
+    }
+    if (profile_modules) {
+        dit->profile_attn_out_seconds += stream_now() - profile_mark;
+        profile_mark = stream_now();
     }
     int fused_int8_mlp_input = dit->int8_mlp &&
         !dit->use_slower_unfused_int8_inputs &&
@@ -2185,6 +2411,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_linear_bf16(dit->gpu, mlp_output, dit->activated,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
+    if (profile_modules) {
+        dit->profile_mlp_seconds += stream_now() - profile_mark;
+        profile_mark = stream_now();
+    }
     if (fuse_next_attention) {
         h3_dit_block *next_weight = &dit->blocks[next_index];
         const h3_gpu_tensor *next_modulation = h3_dit_schedule_block(
@@ -2215,6 +2445,10 @@ static int run_block(h3_dit *dit, unsigned index, int step,
         OP(h3_gpu_gate_bf16(
             dit->gpu, dit->hidden, dit->hidden, mlp_output,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
+    }
+    if (profile_modules) {
+        dit->profile_other_seconds += stream_now() - profile_mark;
+        dit->profile_block_count++;
     }
 #undef OP
     return 1;
@@ -3228,6 +3462,27 @@ void h3_dit_free(h3_dit *dit) {
                     ? gib / dit->stream_read_seconds : 0.0,
                 dit->stream_wait_seconds);
     }
+    if (getenv("H3_PROFILE") && dit->profile_block_count) {
+        double total = dit->profile_qkv_seconds + dit->profile_sdpa_seconds +
+                       dit->profile_attn_out_seconds +
+                       dit->profile_mlp_seconds + dit->profile_other_seconds;
+        fprintf(stderr,
+                "h3 module profile: blocks=%llu qkv=%.3fs (%.1f%%) "
+                "attn=%.3fs (%.1f%%) attn_out=%.3fs (%.1f%%) "
+                "mlp=%.3fs (%.1f%%) other=%.3fs (%.1f%%) encode-wall\n",
+                (unsigned long long)dit->profile_block_count,
+                dit->profile_qkv_seconds,
+                total > 0 ? 100.0 * dit->profile_qkv_seconds / total : 0.0,
+                dit->profile_sdpa_seconds,
+                total > 0 ? 100.0 * dit->profile_sdpa_seconds / total : 0.0,
+                dit->profile_attn_out_seconds,
+                total > 0 ? 100.0 * dit->profile_attn_out_seconds / total : 0.0,
+                dit->profile_mlp_seconds,
+                total > 0 ? 100.0 * dit->profile_mlp_seconds / total : 0.0,
+                dit->profile_other_seconds,
+                total > 0 ? 100.0 * dit->profile_other_seconds / total : 0.0);
+    }
+    h3_veda_plan_free(dit->veda_plan);
     h3_gpu_free(dit->gpu);
     h3_weight_store_free(dit->lora_weights);
     h3_weight_store_free(dit->weights);
