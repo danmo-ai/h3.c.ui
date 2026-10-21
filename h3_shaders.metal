@@ -580,6 +580,7 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = reductions[0] / float(elements);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     local = 0.0f;
     for (uint index = tid; index < elements; index += threadgroup_size.x) {
         uint spatial = index / channels_per_group;
@@ -4010,6 +4011,7 @@ kernel void h3_gqa_causal_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float maximum = reductions[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     for (uint key_row = tid; key_row < key_count; key_row += threads) {
         float probability = exp(scores[key_row] - maximum);
@@ -4423,6 +4425,7 @@ kernel void h3_flash_attn_bf16_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;
@@ -4564,6 +4567,7 @@ kernel void h3_flash_attn_int8_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;
@@ -4683,6 +4687,7 @@ kernel void h3_sparse_attn_bf16_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;
