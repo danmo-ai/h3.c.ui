@@ -34,6 +34,40 @@ The current Veda kernel is scalar (one query row per threadgroup, keys re-read
 from device memory per row, no simdgroup matrix MMA), so a 10 % keep-ratio plan
 is not expected to beat MPSGraph dense SDPA yet.
 
+## Correctness audit against reference implementations
+
+Checked against upstream [antirez/h3.c](https://github.com/antirez/h3.c) and
+the Turbo LoRA reference sampler
+([`larryvrh/MiniMax-H3-Turbo-Lora` `generate.py`](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora)).
+
+| Item | Status |
+|---|---|
+| Video/audio sigma grids (shift 12 / 3, `1 − i/n`) and dual-clock Euler | matches reference |
+| Turbo LoRA coverage (qkv/out/fc1/fc2, token refiner, per-block and final adaLN) | matches reference (adaLN merged in `h3_dit_schedule.c`) |
+| LoRA scale (`alpha = rank`, no extra scaling) | matches reference |
+| LoRA application: merged into BF16, then int8-quantized | **differs** — reference applies `y = W·x + B(A·x)` at run time and warns that merging rounds the update away |
+| `H3_INT8_CACHE` file names | **fixed**: names were `kind_bN`, so FL2VA/Ref2VA and base/Turbo shared cached int8 weights; now prefixed by a checkpoint + LoRA digest (old unprefixed files are ignored) |
+| Veda local plan | **fixed**: video tiles only saw a 1-D local window, so most video rows could not attend to text, keyframe conditions, or audio; prefix rows now stay dense as global keys/queries |
+| Threadgroup reductions in flash / sparse / GQA-causal / VAE-encoder group-norm kernels | **fixed**: `reductions[0]` was read and then overwritten without a barrier (cross-simdgroup race); the GQA and group-norm instances are inherited from upstream |
+
+### Turbo LoRA merge precision (block 20, real weights)
+
+`‖ΔW‖/‖W‖` is 4e-4 for `attn.out_proj` and 1.5e-4 for `mlp.fc2`. Relative
+error of the applied update `x·ΔW_eff` versus the exact `x·(B·A)`:
+
+| Module | Activations | BF16 merge | BF16 merge + int8 (default) |
+|---|---|---:|---:|
+| `attn.out_proj` | isotropic | 0.79 | 4.30 |
+| `attn.out_proj` | inside span(A) | 0.53 | 0.59 |
+| `mlp.fc2` | isotropic | 0.96 | 4.42 |
+| `mlp.fc2` | inside span(A) | 0.88 | 0.93 |
+
+Even in the best case most of the distilled update is lost, so Turbo output
+at 8 steps is closer to the base model at 8 steps than intended. The fix is a
+run-time rank-64 side path (`+ B·(A·x)` before the fused QKV norm/RoPE, after
+the head-major attention gather, and around FC1/FC2), costing ~1.5 % extra
+FLOPs per linear; it touches the fused int8 kernels and needs on-device A/B.
+
 ## Module profile (encode-wall shares)
 
 `H3_PROFILE=1` now prints DiT module encode shares at teardown.
