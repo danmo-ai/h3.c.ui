@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <time.h>
 
 static char h3_global_error[512];
 
@@ -793,10 +794,74 @@ typedef struct {
     h3_ctx *ctx;
     const h3_params *params;
     int cancelled;
+    double started;
+    double phase_started;
+    int phase_index;
+    int phase_count;
+    struct {
+        char name[40];
+        double seconds;
+    } phases[24];
+    double preview_seconds;
+    int preview_count;
 } h3_generation_progress;
+
+static double h3_now(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return 0.0;
+    return (double)value.tv_sec + (double)value.tv_nsec * 1e-9;
+}
+
+static const char *h3_phase_bucket(const char *phase) {
+    if (!strncmp(phase, "denoise", 7)) return "denoise";
+    return phase;
+}
+
+/* Wall time is charged to the most recently entered phase, so a stage that
+ * reports no progress of its own must be marked explicitly. */
+static void h3_phase_mark(h3_generation_progress *state, const char *phase) {
+    if (!state || !phase) return;
+    phase = h3_phase_bucket(phase);
+    double now = h3_now();
+    if (state->phase_index >= 0) {
+        if (!strcmp(state->phases[state->phase_index].name, phase)) return;
+        state->phases[state->phase_index].seconds += now - state->phase_started;
+    }
+    state->phase_started = now;
+    int found = -1;
+    for (int index = 0; index < state->phase_count; index++)
+        if (!strcmp(state->phases[index].name, phase)) found = index;
+    if (found < 0 && state->phase_count <
+            (int)(sizeof(state->phases) / sizeof(state->phases[0]))) {
+        found = state->phase_count++;
+        snprintf(state->phases[found].name, sizeof(state->phases[found].name),
+                 "%s", phase);
+        state->phases[found].seconds = 0.0;
+    }
+    state->phase_index = found;
+}
+
+static void h3_phase_report(h3_generation_progress *state) {
+    if (!state || state->started <= 0.0) return;
+    h3_phase_mark(state, "done");
+    double total = h3_now() - state->started;
+    fprintf(stderr, "h3: stage wall times (total %.1fs):", total);
+    for (int index = 0; index < state->phase_count; index++) {
+        if (!strcmp(state->phases[index].name, "done")) continue;
+        fprintf(stderr, " %s=%.1fs(%.0f%%)", state->phases[index].name,
+                state->phases[index].seconds,
+                total > 0.0 ? 100.0 * state->phases[index].seconds / total : 0.0);
+    }
+    fputc('\n', stderr);
+    if (state->preview_count)
+        fprintf(stderr, "h3: live denoise previews took %.1fs over %d steps "
+                "(included in denoise)\n",
+                state->preview_seconds, state->preview_count);
+}
 
 static void h3_progress_emit(h3_generation_progress *state, const char *phase,
                              int completed, int total) {
+    if (state && phase) h3_phase_mark(state, phase);
     if (!state || state->cancelled || !state->params->on_progress) return;
     if (state->params->on_progress(phase, completed, total,
                                    state->params->callback_opaque)) {
@@ -899,9 +964,9 @@ typedef struct {
     int failed;
 } h3_live_preview;
 
-static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
-                                      const float *video_latent,
-                                      size_t video_elements, void *opaque) {
+static int h3_decode_denoise_preview(int completed_steps, int total_steps,
+                                     const float *video_latent,
+                                     size_t video_elements, void *opaque) {
     h3_live_preview *preview = opaque;
     if (!preview || !preview->progress || !preview->decoder || !video_latent) {
         if (preview && preview->progress)
@@ -974,6 +1039,21 @@ static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
     return 0;
 }
 
+static int h3_deliver_denoise_preview(int completed_steps, int total_steps,
+                                      const float *video_latent,
+                                      size_t video_elements, void *opaque) {
+    h3_live_preview *preview = opaque;
+    double started = h3_now();
+    int status = h3_decode_denoise_preview(completed_steps, total_steps,
+                                           video_latent, video_elements,
+                                           opaque);
+    if (preview && preview->progress) {
+        preview->progress->preview_seconds += h3_now() - started;
+        preview->progress->preview_count++;
+    }
+    return status;
+}
+
 /* Qwen consumes reference video as time-major two-frame blocks, while the
  * visual VAE and media boundary retain channel-major [3,T,H,W]. */
 static float *h3_extract_vision_pair(const float *pixels, int frames,
@@ -1025,7 +1105,13 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
         h3_set_error(ctx, "ordered references require the Ref2VA checkpoint");
         return NULL;
     }
-    h3_generation_progress progress = {ctx, params, 0};
+    h3_generation_progress progress;
+    memset(&progress, 0, sizeof(progress));
+    progress.ctx = ctx;
+    progress.params = params;
+    progress.phase_index = -1;
+    progress.started = h3_now();
+    h3_phase_mark(&progress, "setup");
     h3_temporal_shape temporal = h3_temporal(params->frames);
     int latent_w, latent_h;
     h3_latent_canvas(render_width, render_height, &latent_w, &latent_h);
@@ -1646,6 +1732,18 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     }
     float spatial_rope_scale = !params->use_reference_rope &&
         render_width == 256 && render_height == 256 ? 0.5f : 1.0f;
+    fprintf(stderr,
+            "h3: run shape %dx%d canvas, %d frames, latent %dx%dx%d, "
+            "%zu video + %d audio + %zu text tokens, %d steps, "
+            "turbo-lora=%d reuse=%d layers=%d\n",
+            render_width, render_height, temporal.frame_count,
+            temporal.video_t, latent_h, latent_w,
+            (size_t)temporal.video_t * (size_t)(latent_h / 2) *
+                (size_t)(latent_w / 2),
+            temporal.audio_t, text.tokens, params->steps,
+            turbo_lora_path != NULL, params->denoise_reuse,
+            params->dit_layers);
+    h3_phase_mark(&progress, "DiT prepare");
     if (ctx->cache_enabled && ctx->dit && ctx->dit_key &&
         !strcmp(ctx->dit_key, prepared_key)) {
         dit = ctx->dit;
@@ -1802,6 +1900,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
             goto cleanup;
         }
     }
+    h3_phase_mark(&progress, "video VAE decode");
     int video_ok = preview_decoder ?
         h3_video_vae_decoder_decode(
             preview_decoder, video, temporal.video_t, &frames,
@@ -1818,6 +1917,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(video);
     video = NULL;
     if (progress.cancelled) goto cleanup;
+    h3_phase_mark(&progress, "frame output");
     size_t rgb_count = (size_t)frames.frames * (size_t)frames.height *
                        (size_t)frames.width * 3;
     rgb8 = h3_rgb_f32_to_u8(frames.rgb, rgb_count);
@@ -1878,6 +1978,7 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     result->seed = params->seed;
 
 cleanup:
+    h3_phase_report(&progress);
     free(conditioning_key);
     free(prepared_key);
     free(decoder_key);

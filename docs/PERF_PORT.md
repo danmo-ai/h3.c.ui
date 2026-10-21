@@ -2,6 +2,38 @@
 
 Measured on Apple M5 Max 128 GiB with `/Users/nil.luo/.h3-ui/models/MiniMax-H3`.
 
+## Stage wall times
+
+Every generation ends with one stderr line (desktop: `~/.h3-ui/api.log`):
+
+```
+h3: run shape 864x480 canvas, 243 frames, latent 72x30x54, 29160 video + 400 audio + N text tokens, 8 steps, turbo-lora=1 reuse=1 layers=50
+h3: stage wall times (total …s): setup=… text encoder=… DiT prepare=… load transformer core=… denoise=… audio VAE=… video VAE decode=… FFmpeg=…
+h3: live denoise previews took …s over 8 steps (included in denoise)
+```
+
+Use it before changing knobs: step-count levers (Turbo LoRA, `--reuse`) only
+shrink `denoise`; they cannot move load, VAE, or FFmpeg time.
+
+### Duration scaling
+
+Tokens per latent frame are `(W/32)·(H/32)` (VAE /16 then 2×2 patch); latent
+frames are `(aligned_frames − 5)/17·5 + 2`. At 864×480:
+
+| Duration | Aligned frames | Video tokens | Linear cost | Attention cost |
+|---|---:|---:|---:|---:|
+| 2.3 s (default 56f) | 56 | 6 885 | 1× | 1× |
+| 10 s | 243 | 29 160 | 4.2× | ~18× |
+
+At 10 s each step is ~2.4 PFLOP over 50 blocks, split roughly evenly between
+dense attention and the linears, so only attention-side work
+(token reduction, a competitive sparse/flash kernel, lower `render_*` canvas)
+and fewer evaluations scale well.
+
+The current Veda kernel is scalar (one query row per threadgroup, keys re-read
+from device memory per row, no simdgroup matrix MMA), so a 10 % keep-ratio plan
+is not expected to beat MPSGraph dense SDPA yet.
+
 ## Module profile (encode-wall shares)
 
 `H3_PROFILE=1` now prints DiT module encode shares at teardown.
