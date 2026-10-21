@@ -161,7 +161,7 @@ static void print_help(void) {
     puts("  !core-reuse [N]          Set or show core reuse");
     puts("  !token-reduction [on|off]  Toggle token reduction");
     puts("  !veda [on|off]            Toggle Veda tile-sparse attention");
-    puts("  !turbo-lora [on|off]      Toggle 8-step Turbo LoRA merge");
+    puts("  !turbo-lora [on|off]      Toggle 8-step Turbo LoRA");
     puts("  !ssd-streaming [on|off]   Toggle original-BF16 SSD streaming");
     puts("  !int8-row-fc2 [on|off]    Toggle faster one-scale FC2");
     puts("  !reference-rope [on|off]  Toggle released spatial RoPE");

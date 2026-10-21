@@ -1016,6 +1016,19 @@ struct h3_qkv_project_rope_args {
     float epsilon;
 };
 
+/* head_major bit 8 marks a run-time LoRA update stored row-major in
+ * checkpoint column order ([rows, heads * 3 * head_dim]), added before the
+ * Q/K norm and RoPE epilogue. */
+constant uint H3_QKV_LORA_DELTA = 8u;
+
+inline float h3_qkv_delta(device const bfloat *delta,
+                          constant h3_qkv_project_rope_args &args,
+                          uint row, uint checkpoint_column) {
+    if (!(args.head_major & H3_QKV_LORA_DELTA)) return 0.0f;
+    return (float)delta[row * (args.heads * args.head_dim * 3u) +
+                        checkpoint_column];
+}
+
 /* Preserve the successful direct 128x64 TensorOps matmul, but route each
  * grouped checkpoint tile directly to its Q, K, or V destination. The six
  * 64-column tiles of every head align exactly with Q0/Q1/K0/K1/V0/V1. */
@@ -1703,6 +1716,7 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
                            device bfloat *value [[buffer(6)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(7)]],
+                           device const bfloat *delta [[buffer(8)]],
                            uint code [[threadgroup_position_in_grid]]) {
     constexpr uint TILE = 128;
     constexpr uint STREAMS = 3;
@@ -1749,7 +1763,9 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * input_scales[row] *
-                         weight_scales[checkpoint_column + column]);
+                         weight_scales[checkpoint_column + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
 }
 
@@ -1774,6 +1790,7 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(
                            device const bfloat *rope_sin [[buffer(10)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(11)]],
+                           device const bfloat *delta [[buffer(12)]],
                            uint code [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
@@ -1824,7 +1841,9 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * input_scales[row] *
-                         weight_scales[checkpoint_column + column]);
+                         weight_scales[checkpoint_column + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
     if (stream < 2) {
         threadgroup float inverse[TILE];
@@ -1962,6 +1981,7 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4_impl(
                            device const bfloat *rope_sin [[buffer(10)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(11)]],
+                           device const bfloat *delta [[buffer(12)]],
                            uint code [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
@@ -2017,7 +2037,9 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4_impl(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * scratch[(uint)index[1]] *
-                         scratch[TILE + column]);
+                         scratch[TILE + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
     if (stream < 2) {
         device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
@@ -2151,6 +2173,7 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
                            device const float *weight_scales [[buffer(3)]],
                            device bfloat *output [[buffer(4)]],
                            constant linear_args &args [[buffer(5)]],
+                           device const bfloat *delta [[buffer(6)]],
                            uint code [[threadgroup_position_in_grid]]) {
     constexpr uint TILE = 128;
     uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
@@ -2162,6 +2185,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
     uint column_start = group.y * TILE;
     uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
     constexpr bool FULL_PRODUCT = INPUT_DIM != 0 && K_TILE == INPUT_DIM;
+    /* has_bias marks a run-time LoRA update laid out as [rows, 2 * FFN]. */
+    bool has_delta = args.has_bias != 0;
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
@@ -2205,6 +2230,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
             uint column = column_start + (uint)index[0];
             float value = (float)accum[element] * input_scales[row] *
                           weight_scales[column];
+            if (has_delta && row < args.rows)
+                value += (float)delta[row * args.output_dim * 2 + column];
             gate_tile[(uint)index[1] * TILE + (uint)index[0]] =
                 (bfloat)value;
         }
@@ -2247,6 +2274,9 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
             float gate = (float)gate_tile[local];
             float up = (float)accum[element] * input_scales[row] *
                        weight_scales[args.output_dim + column];
+            if (has_delta)
+                up = (float)(bfloat)(up + (float)delta[
+                    row * args.output_dim * 2 + args.output_dim + column]);
             output[row * args.output_dim + column] =
                 (bfloat)(gate / (1.0f + exp(-gate)) * up);
         }
@@ -4062,6 +4092,26 @@ kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
     if (gid >= count) return;
     output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(left[gid]) +
                                   h3_bf16_to_f32(right[gid]));
+}
+
+struct h3_head_major_rows_args {
+    uint rows;
+    uint heads;
+    uint head_dim;
+};
+
+kernel void h3_head_major_to_rows_bf16(
+                         device const ushort *input [[buffer(0)]],
+                         device ushort *output [[buffer(1)]],
+                         constant h3_head_major_rows_args &args [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    uint width = args.heads * args.head_dim;
+    if (gid >= args.rows * width) return;
+    uint row = gid / width;
+    uint column = gid - row * width;
+    uint head = column / args.head_dim;
+    uint dim = column - head * args.head_dim;
+    output[gid] = input[(head * args.rows + row) * args.head_dim + dim];
 }
 
 kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],

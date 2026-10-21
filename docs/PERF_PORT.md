@@ -43,9 +43,9 @@ the Turbo LoRA reference sampler
 | Item | Status |
 |---|---|
 | Video/audio sigma grids (shift 12 / 3, `1 − i/n`) and dual-clock Euler | matches reference |
-| Turbo LoRA coverage (qkv/out/fc1/fc2, token refiner, per-block and final adaLN) | matches reference (adaLN merged in `h3_dit_schedule.c`) |
+| Turbo LoRA coverage (qkv/out/fc1/fc2, token refiner, per-block and final adaLN) | matches reference |
 | LoRA scale (`alpha = rank`, no extra scaling) | matches reference |
-| LoRA application: merged into BF16, then int8-quantized | **differs** — reference applies `y = W·x + B(A·x)` at run time and warns that merging rounds the update away |
+| LoRA application | **fixed**: was merged into BF16 then int8-quantized; now applied at run time as `y = W·x + B(A·x)` like the reference (`H3_TURBO_LORA_MERGE=1` restores the merge for A/B) |
 | `H3_INT8_CACHE` file names | **fixed**: names were `kind_bN`, so FL2VA/Ref2VA and base/Turbo shared cached int8 weights; now prefixed by a checkpoint + LoRA digest (old unprefixed files are ignored) |
 | Veda local plan | **fixed**: video tiles only saw a 1-D local window, so most video rows could not attend to text, keyframe conditions, or audio; prefix rows now stay dense as global keys/queries |
 | Threadgroup reductions in flash / sparse / GQA-causal / VAE-encoder group-norm kernels | **fixed**: `reductions[0]` was read and then overwritten without a barrier (cross-simdgroup race); the GQA and group-norm instances are inherited from upstream |
@@ -62,11 +62,29 @@ error of the applied update `x·ΔW_eff` versus the exact `x·(B·A)`:
 | `mlp.fc2` | isotropic | 0.96 | 4.42 |
 | `mlp.fc2` | inside span(A) | 0.88 | 0.93 |
 
-Even in the best case most of the distilled update is lost, so Turbo output
-at 8 steps is closer to the base model at 8 steps than intended. The fix is a
-run-time rank-64 side path (`+ B·(A·x)` before the fused QKV norm/RoPE, after
-the head-major attention gather, and around FC1/FC2), costing ~1.5 % extra
-FLOPs per linear; it touches the fused int8 kernels and needs on-device A/B.
+Even in the best case most of the distilled update is lost, so the merge was
+replaced by a run-time rank-64 side path: `+ B·(A·x)` inside the fused int8
+QKV epilogue (before Q/K norm and RoPE) and FC1 epilogue (before SwiGLU), and
+as a residual add after the head-major attention output and FC2; the adaLN
+schedule and token refiner add it after their BF16 linears.
+`tests/test_lora_runtime.c` checks the kernels against a CPU reference.
+
+### Turbo LoRA run-time A/B (real weights, step-0 video velocity)
+
+480×288, 22 frames, 8 steps, seed 7, identical inputs. Reference R is the
+BF16 path with run-time LoRA (equivalent to `generate.py`); `u = R − base`.
+
+| Config | rel. error vs R | `‖Δ_X‖/‖u‖` | `‖Δ_X − u‖/‖u‖` |
+|---|---:|---:|---:|
+| int8 + run-time LoRA (default) | **0.059** | 1.02 | 0.14 |
+| int8 + merged LoRA (old default) | 0.156 | 0.68 | 0.37 |
+| BF16 + merged LoRA | 0.143 | 0.65 | 0.37 |
+
+The LoRA update is 38 % of the velocity norm and the int8 base alone differs
+from BF16 by 0.075, so the run-time path sits at the int8 noise floor while
+the merge dropped about a third of the distilled update. 10 s 864×480 Turbo
+denoise: 515 s run-time vs 614 s merged (run-to-run variance; no measurable
+LoRA overhead).
 
 ## Module profile (encode-wall shares)
 

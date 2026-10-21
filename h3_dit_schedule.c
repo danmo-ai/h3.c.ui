@@ -269,13 +269,22 @@ static int read_lora_alpha(const h3_weight_store *store, const char *name,
     return 0;
 }
 
-static int merge_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *weight,
-                            const h3_weight_store *lora,
-                            const char *key_prefix,
-                            const char *a_suffix, const char *b_suffix,
-                            const char *module, uint32_t rows,
-                            uint32_t columns, char *error,
-                            size_t error_size) {
+typedef struct {
+    h3_gpu_tensor *a;
+    h3_gpu_tensor *b;
+    uint32_t rank;
+} adaln_adapter;
+
+/* Loads a Turbo AdaLN adapter. The reference applies it unmerged; a BF16
+ * merge rounds most of the low-rank update away, so it is kept for
+ * apply_adaln_lora unless H3_TURBO_LORA_MERGE is set or alpha != rank. */
+static int prepare_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *weight,
+                              const h3_weight_store *lora,
+                              const char *key_prefix,
+                              const char *a_suffix, const char *b_suffix,
+                              const char *module, uint32_t rows,
+                              uint32_t columns, adaln_adapter *runtime,
+                              char *error, size_t error_size) {
     if (!lora || !a_suffix || !b_suffix) return 1;
     char a_name[192];
     char b_name[192];
@@ -313,6 +322,13 @@ static int merge_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *weight,
         h3_weight_load_bf16(lora, gpu, a_name, 2, a_shape, error, error_size);
     h3_gpu_tensor *lora_b =
         h3_weight_load_bf16(lora, gpu, b_name, 2, b_shape, error, error_size);
+    if (lora_a && lora_b && fabsf(scale - 1.0f) <= 1e-6f &&
+        !getenv("H3_TURBO_LORA_MERGE")) {
+        runtime->a = lora_a;
+        runtime->b = lora_b;
+        runtime->rank = rank;
+        return 1;
+    }
     int ok = lora_a && lora_b &&
              gpu_op(gpu, h3_gpu_begin(gpu), error, error_size,
                     "begin Turbo LoRA AdaLN merge") &&
@@ -325,6 +341,38 @@ static int merge_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *weight,
     free_tensor(&lora_a);
     free_tensor(&lora_b);
     return ok;
+}
+
+/* output += B(A(time)); encoded inside the caller's command. */
+static int apply_adaln_lora(h3_gpu *gpu, h3_gpu_tensor *output,
+                            const h3_gpu_tensor *time, uint32_t time_rows,
+                            const adaln_adapter *adapter, uint32_t rows,
+                            char *error, size_t error_size) {
+    if (!adapter->a) return 1;
+    h3_gpu_tensor *rank = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)time_rows * adapter->rank);
+    h3_gpu_tensor *delta = h3_gpu_tensor_new_bf16(
+        gpu, (size_t)time_rows * rows);
+    int ok = rank && delta &&
+        gpu_op(gpu, h3_gpu_lora_bf16(gpu, delta, rank, time, adapter->a,
+                                     adapter->b, time_rows, H3_DIT_TIME_DIM,
+                                     adapter->rank, rows),
+               error, error_size, "Turbo LoRA AdaLN") &&
+        gpu_op(gpu, h3_gpu_add_bf16(gpu, output, output, delta,
+                                    time_rows * rows),
+               error, error_size, "Turbo LoRA AdaLN residual") &&
+        gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+               "submit Turbo LoRA AdaLN");
+    if (!rank || !delta)
+        fail(error, error_size, "cannot allocate Turbo LoRA AdaLN tensors");
+    free_tensor(&rank);
+    free_tensor(&delta);
+    return ok;
+}
+
+static void free_adaln_adapter(adaln_adapter *adapter) {
+    free_tensor(&adapter->a);
+    free_tensor(&adapter->b);
 }
 
 h3_dit_schedule *h3_dit_schedule_precompute(
@@ -381,11 +429,12 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             goto failed;
         }
         char module[128];
+        adaln_adapter adapter = {0};
         snprintf(module, sizeof(module), "blocks.%u.adaln_proj.linear", block);
-        if (!merge_adaln_lora(gpu, weight, lora_weights, lora_key_prefix,
-                              lora_a_suffix, lora_b_suffix, module,
-                              BLOCK_OUTPUT, H3_DIT_TIME_DIM, error,
-                              error_size)) {
+        if (!prepare_adaln_lora(gpu, weight, lora_weights, lora_key_prefix,
+                                lora_a_suffix, lora_b_suffix, module,
+                                BLOCK_OUTPUT, H3_DIT_TIME_DIM, &adapter,
+                                error, error_size)) {
             free_tensor(&weight);
             free_tensor(&bias);
             h3_gpu_tensor_free(time);
@@ -397,9 +446,14 @@ h3_dit_schedule *h3_dit_schedule_precompute(
                 gpu, schedule->blocks[block], time, weight, bias,
                 schedule->time_rows, H3_DIT_TIME_DIM, BLOCK_OUTPUT),
                 error, error_size, operation) &&
-            gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation);
+            (adapter.a ?
+             apply_adaln_lora(gpu, schedule->blocks[block], time,
+                              schedule->time_rows, &adapter, BLOCK_OUTPUT,
+                              error, error_size) :
+             gpu_op(gpu, h3_gpu_submit(gpu), error, error_size, operation));
         free_tensor(&weight);
         free_tensor(&bias);
+        free_adaln_adapter(&adapter);
         if (!ok) {
             h3_gpu_tensor_free(time);
             goto failed;
@@ -416,11 +470,13 @@ h3_dit_schedule *h3_dit_schedule_precompute(
         FINAL_OUTPUT, error, error_size);
     schedule->final = h3_gpu_tensor_new_bf16(
         gpu, (size_t)schedule->time_rows * FINAL_OUTPUT);
+    adaln_adapter final_adapter = {0};
     if (final_w &&
-        !merge_adaln_lora(gpu, final_w, lora_weights, lora_key_prefix,
-                          lora_a_suffix, lora_b_suffix,
-                          "final_layer.adaln_proj.linear", FINAL_OUTPUT,
-                          H3_DIT_TIME_DIM, error, error_size)) {
+        !prepare_adaln_lora(gpu, final_w, lora_weights, lora_key_prefix,
+                            lora_a_suffix, lora_b_suffix,
+                            "final_layer.adaln_proj.linear", FINAL_OUTPUT,
+                            H3_DIT_TIME_DIM, &final_adapter, error,
+                            error_size)) {
         free_tensor(&final_w);
         free_tensor(&final_b);
         h3_gpu_tensor_free(time);
@@ -433,18 +489,23 @@ h3_dit_schedule *h3_dit_schedule_precompute(
             gpu, schedule->final, time, final_w, final_b, schedule->time_rows,
             H3_DIT_TIME_DIM, FINAL_OUTPUT), error, error_size,
             "final AdaLN projection") ||
-        !gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
-                "submit final AdaLN")) {
+        !(final_adapter.a ?
+          apply_adaln_lora(gpu, schedule->final, time, schedule->time_rows,
+                           &final_adapter, FINAL_OUTPUT, error, error_size) :
+          gpu_op(gpu, h3_gpu_submit(gpu), error, error_size,
+                 "submit final AdaLN"))) {
         if ((!error || !*error) && (!final_w || !final_b || !schedule->final))
             fail(error, error_size, "cannot allocate final AdaLN tensors: %s",
                  h3_gpu_error(gpu));
         free_tensor(&final_w);
         free_tensor(&final_b);
+        free_adaln_adapter(&final_adapter);
         h3_gpu_tensor_free(time);
         goto failed;
     }
     free_tensor(&final_w);
     free_tensor(&final_b);
+    free_adaln_adapter(&final_adapter);
     h3_gpu_tensor_free(time);
     return schedule;
 

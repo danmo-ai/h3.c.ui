@@ -359,6 +359,37 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
                          int input_is_quantized);
+/* int8 MLP with a run-time LoRA update for FC1 ([rows, 2 * hidden_dim],
+ * gate then up) added before SwiGLU. */
+int h3_gpu_mlp_int8_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              h3_gpu_tensor *activated,
+                              h3_gpu_tensor *quantized_activation,
+                              h3_gpu_tensor *activation_scales,
+                              const h3_gpu_tensor *input,
+                              const h3_gpu_tensor *fc1_weight,
+                              const h3_gpu_tensor *fc1_scales,
+                              const h3_gpu_tensor *fc2_weight,
+                              const h3_gpu_tensor *fc2_scales,
+                              const h3_gpu_tensor *fc1_delta,
+                              uint32_t rows, uint32_t input_dim,
+                              uint32_t hidden_dim, uint32_t output_dim,
+                              int use_slower_grouped_quantizer,
+                              int use_slower_dynamic_fc1_k,
+                              int use_int8_row_fc2);
+/* Unmerged low-rank update: delta = (input A^T) B^T with A [rank, input_dim]
+ * and B [output_dim, rank]; the rank activation is stored as BF16. */
+int h3_gpu_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *delta,
+                     h3_gpu_tensor *rank_scratch,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *lora_a,
+                     const h3_gpu_tensor *lora_b, uint32_t rows,
+                     uint32_t input_dim, uint32_t rank,
+                     uint32_t output_dim);
+/* [heads, rows, head_dim] -> [rows, heads * head_dim]. */
+int h3_gpu_head_major_to_rows_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *input,
+                                   uint32_t rows, uint32_t heads,
+                                   uint32_t head_dim);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -495,6 +526,29 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  uint32_t heads, uint32_t head_dim,
                                  uint32_t rope_half, float epsilon,
                                  int input_is_quantized,
+                                 int use_slower_unfused_qkv_rope,
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales);
+/* Same projection with a run-time LoRA update added before Q/K norm and
+ * RoPE; delta is row-major [rows, 3 * heads * head_dim] in checkpoint order. */
+int h3_gpu_grouped_qkv_linear_rope_int8_lora(
+                                 h3_gpu *gpu,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *quantized_input,
+                                 h3_gpu_tensor *input_scales,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 const h3_gpu_tensor *delta,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon,
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);

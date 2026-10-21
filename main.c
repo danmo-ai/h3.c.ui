@@ -33,7 +33,7 @@ static void usage(const char *program) {
         "      --core-reuse N     Core refresh: 1 exact, 4 fast, 6 aggressive\n"
         "      --token-reduction  Pair video tokens in middle DiT blocks\n"
         "      --veda             Use Veda tile-sparse DiT attention\n"
-        "      --turbo-lora       Merge 8-step Turbo LoRA into DiT linears\n"
+        "      --turbo-lora       Apply 8-step Turbo LoRA to DiT linears\n"
         "      --ssd-streaming    Stream original BF16 DiT layers from SSD\n"
         "      --use-int8-row-fc2 Faster one-scale int8 FC2 (M5)\n"
         "      --use-reference-rope  Disable native 256 RoPE adaptation\n"
