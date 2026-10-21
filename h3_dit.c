@@ -104,6 +104,7 @@ struct h3_dit {
     double profile_other_seconds;
     uint64_t profile_block_count;
     h3_weight_store *lora_weights;
+    char int8_cache_tag[17];
     const char *lora_key_prefix;
     const char *lora_a_suffix;
     const char *lora_b_suffix;
@@ -856,12 +857,33 @@ static int ensure_directory(const char *path) {
     return 0;
 }
 
-static int int8_cache_file(char *path, size_t path_size, const char *kind,
-                           unsigned block_index, const char *part) {
+/* Cached int8 weights depend on the checkpoint and on any merged LoRA, so
+ * file names carry a digest of both. */
+static void int8_cache_tag(h3_dit *dit, const char *weight_directory,
+                           const char *turbo_lora_path) {
+    uint64_t hash = 1469598103934665603ull;
+    const char *parts[] = {weight_directory ? weight_directory : "",
+                           turbo_lora_path ? turbo_lora_path : ""};
+    for (size_t part = 0; part < sizeof(parts) / sizeof(*parts); part++) {
+        for (const unsigned char *at = (const unsigned char *)parts[part];
+             *at; at++) {
+            hash ^= *at;
+            hash *= 1099511628211ull;
+        }
+        hash ^= 0xffu;
+        hash *= 1099511628211ull;
+    }
+    snprintf(dit->int8_cache_tag, sizeof(dit->int8_cache_tag), "%016llx",
+             (unsigned long long)hash);
+}
+
+static int int8_cache_file(char *path, size_t path_size, const char *tag,
+                           const char *kind, unsigned block_index,
+                           const char *part) {
     char directory[512];
     if (!int8_cache_dir(directory, sizeof(directory))) return 0;
     if (!ensure_directory(directory)) return 0;
-    snprintf(path, path_size, "%s/%s_b%u_%s.bin", directory, kind,
+    snprintf(path, path_size, "%s/%s_%s_b%u_%s.bin", directory, tag, kind,
              block_index, part);
     return 1;
 }
@@ -883,13 +905,14 @@ static int read_tensor_blob(const char *path, void *bytes, size_t byte_count) {
     return ok;
 }
 
-static int cache_store_pair(const char *kind, unsigned block,
+static int cache_store_pair(const char *tag, const char *kind,
+                            unsigned block,
                             h3_gpu_tensor *i8, h3_gpu_tensor *scales,
                             size_t i8_count, size_t scale_count) {
     char i8_path[768];
     char scale_path[768];
-    if (!int8_cache_file(i8_path, sizeof(i8_path), kind, block, "i8") ||
-        !int8_cache_file(scale_path, sizeof(scale_path), kind, block,
+    if (!int8_cache_file(i8_path, sizeof(i8_path), tag, kind, block, "i8") ||
+        !int8_cache_file(scale_path, sizeof(scale_path), tag, kind, block,
                          "scales"))
         return 0;
     int8_t *i8_host = malloc(i8_count);
@@ -905,17 +928,16 @@ static int cache_store_pair(const char *kind, unsigned block,
     return ok;
 }
 
-static int cache_load_pair(h3_gpu *gpu, const char *kind, unsigned block,
+static int cache_load_pair(h3_gpu *gpu, const char *tag, const char *kind,
+                           unsigned block,
                            h3_gpu_tensor **i8_out, h3_gpu_tensor **scales_out,
                            size_t i8_count, size_t scale_count) {
     char i8_path[768];
     char scale_path[768];
-    char directory[512];
-    if (!int8_cache_dir(directory, sizeof(directory))) return 0;
-    snprintf(i8_path, sizeof(i8_path), "%s/%s_b%u_i8.bin", directory, kind,
-             block);
-    snprintf(scale_path, sizeof(scale_path), "%s/%s_b%u_scales.bin", directory,
-             kind, block);
+    if (!int8_cache_file(i8_path, sizeof(i8_path), tag, kind, block, "i8") ||
+        !int8_cache_file(scale_path, sizeof(scale_path), tag, kind, block,
+                         "scales"))
+        return 0;
     int8_t *i8_host = malloc(i8_count);
     float *scale_host = malloc(scale_count * sizeof(float));
     if (!i8_host || !scale_host ||
@@ -945,10 +967,10 @@ static int try_load_cached_mlp(h3_dit *dit, h3_dit_block *block,
                                unsigned block_index) {
     h3_gpu_tensor *fc1_int8 = NULL, *fc1_scales = NULL;
     h3_gpu_tensor *fc2_int8 = NULL, *fc2_scales = NULL;
-    if (!cache_load_pair(dit->gpu, "mlp_fc1", block_index, &fc1_int8,
-                         &fc1_scales, (size_t)FFN * 2 * HIDDEN, FFN * 2) ||
-        !cache_load_pair(dit->gpu, "mlp_fc2", block_index, &fc2_int8,
-                         &fc2_scales, (size_t)HIDDEN * FFN, HIDDEN)) {
+    if (!cache_load_pair(dit->gpu, dit->int8_cache_tag, "mlp_fc1",
+                         block_index, &fc1_int8, &fc1_scales, (size_t)FFN * 2 * HIDDEN, FFN * 2) ||
+        !cache_load_pair(dit->gpu, dit->int8_cache_tag, "mlp_fc2",
+                         block_index, &fc2_int8, &fc2_scales, (size_t)HIDDEN * FFN, HIDDEN)) {
         h3_gpu_tensor_free(fc1_int8);
         h3_gpu_tensor_free(fc1_scales);
         h3_gpu_tensor_free(fc2_int8);
@@ -994,9 +1016,11 @@ static int quantize_block_mlp(h3_dit *dit, h3_dit_block *block,
         return 0;
     }
     if (int8_cache_enabled()) {
-        cache_store_pair("mlp_fc1", block_index, block->fc1_int8,
+        cache_store_pair(dit->int8_cache_tag, "mlp_fc1", block_index,
+                         block->fc1_int8,
                          block->fc1_scales, (size_t)FFN * 2 * HIDDEN, FFN * 2);
-        cache_store_pair("mlp_fc2", block_index, block->fc2_int8,
+        cache_store_pair(dit->int8_cache_tag, "mlp_fc2", block_index,
+                         block->fc2_int8,
                          block->fc2_scales, (size_t)HIDDEN * FFN, HIDDEN);
     }
     if (!dit->keep_bf16_mlp) {
@@ -1010,7 +1034,8 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
                               char *error, size_t error_size) {
     unsigned block_index = (unsigned)(block - dit->blocks);
     if (int8_cache_enabled() &&
-        cache_load_pair(dit->gpu, "qkv", block_index, &block->qkv_int8,
+        cache_load_pair(dit->gpu, dit->int8_cache_tag, "qkv", block_index,
+                        &block->qkv_int8,
                         &block->qkv_scales, (size_t)INNER * 3 * HIDDEN,
                         INNER * 3)) {
         if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
@@ -1031,7 +1056,8 @@ static int quantize_block_qkv(h3_dit *dit, h3_dit_block *block,
         return 0;
     }
     if (int8_cache_enabled())
-        cache_store_pair("qkv", block_index, block->qkv_int8,
+        cache_store_pair(dit->int8_cache_tag, "qkv", block_index,
+                         block->qkv_int8,
                          block->qkv_scales, (size_t)INNER * 3 * HIDDEN,
                          INNER * 3);
     if (!dit->keep_bf16_qkv) free_tensor(&block->qkv);
@@ -1042,7 +1068,8 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
                                         char *error, size_t error_size) {
     unsigned block_index = (unsigned)(block - dit->blocks);
     if (int8_cache_enabled() &&
-        cache_load_pair(dit->gpu, "attn_out", block_index, &block->out_int8,
+        cache_load_pair(dit->gpu, dit->int8_cache_tag, "attn_out",
+                        block_index, &block->out_int8,
                         &block->out_scales, (size_t)HIDDEN * INNER, HIDDEN)) {
         if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
         return 1;
@@ -1063,7 +1090,8 @@ static int quantize_block_attention_out(h3_dit *dit, h3_dit_block *block,
         return 0;
     }
     if (int8_cache_enabled())
-        cache_store_pair("attn_out", block_index, block->out_int8,
+        cache_store_pair(dit->int8_cache_tag, "attn_out", block_index,
+                         block->out_int8,
                          block->out_scales, (size_t)HIDDEN * INNER, HIDDEN);
     if (!dit->keep_bf16_attention_out) free_tensor(&block->out);
     return 1;
@@ -1965,6 +1993,8 @@ static h3_dit *load_dit(const char *weight_directory,
             !configure_lora_layout(dit, error, error_size)) goto failed;
         fprintf(stderr, "h3: merging Turbo LoRA from %s\n", turbo_lora_path);
     }
+    int8_cache_tag(dit, weight_directory,
+                   dit->lora_weights ? turbo_lora_path : NULL);
     if (veda) {
         const char *plan_path = getenv("H3_VEDA_PLAN");
         float keep_ratio = 0.10f;
