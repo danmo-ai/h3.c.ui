@@ -89,45 +89,82 @@ static h3_veda_plan *plan_from_host(h3_gpu *gpu, uint32_t sequence,
     return plan;
 }
 
-h3_veda_plan *h3_veda_plan_build_local(h3_gpu *gpu, uint32_t sequence,
-                                       uint32_t tile_size, float keep_ratio,
-                                       char *error, size_t error_size) {
-    if (!gpu || !sequence || !tile_size || keep_ratio <= 0.0f ||
-        keep_ratio > 1.0f) {
-        fail(error, error_size, "invalid Veda local-plan arguments");
-        return NULL;
+static int local_pair_selected(uint32_t q, uint32_t k, uint32_t q_tiles,
+                               uint32_t keep, uint32_t global_tiles) {
+    if (q < global_tiles || k < global_tiles) return 1;
+    /* Always keep the diagonal tile, then expand a symmetric window. */
+    int32_t radius = (int32_t)((keep - 1u) / 2u);
+    int32_t start = (int32_t)q - radius;
+    if (start < 0) start = 0;
+    uint32_t end = (uint32_t)start + keep;
+    if (end > q_tiles) {
+        end = q_tiles;
+        start = (int32_t)(end - keep);
+        if (start < 0) start = 0;
     }
+    return k >= (uint32_t)start && k < end;
+}
+
+int h3_veda_local_pairs(uint32_t sequence, uint32_t tile_size,
+                        float keep_ratio, uint32_t global_rows,
+                        uint32_t **q_offsets_out, uint32_t **k_tiles_out,
+                        uint32_t *q_tiles_out, uint32_t *pair_count_out) {
+    if (!q_offsets_out || !k_tiles_out || !q_tiles_out || !pair_count_out ||
+        !sequence || !tile_size || keep_ratio <= 0.0f || keep_ratio > 1.0f ||
+        global_rows > sequence) return 0;
+    *q_offsets_out = NULL;
+    *k_tiles_out = NULL;
     uint32_t q_tiles = (sequence + tile_size - 1u) / tile_size;
     uint32_t keep = (uint32_t)((float)q_tiles * keep_ratio + 0.999f);
     if (keep < 1u) keep = 1u;
     if (keep > q_tiles) keep = q_tiles;
+    uint32_t global_tiles = (global_rows + tile_size - 1u) / tile_size;
 
+    size_t pair_count = 0;
+    for (uint32_t q = 0; q < q_tiles; q++)
+        for (uint32_t k = 0; k < q_tiles; k++)
+            pair_count += (size_t)local_pair_selected(q, k, q_tiles, keep,
+                                                      global_tiles);
+    if (pair_count > UINT32_MAX) return 0;
     uint32_t *q_offsets = calloc((size_t)q_tiles + 1u, sizeof(uint32_t));
-    uint32_t *k_tiles = calloc((size_t)q_tiles * keep, sizeof(uint32_t));
+    uint32_t *k_tiles = calloc(pair_count ? pair_count : 1u,
+                               sizeof(uint32_t));
     if (!q_offsets || !k_tiles) {
         free(q_offsets);
         free(k_tiles);
+        return 0;
+    }
+    uint32_t cursor = 0;
+    for (uint32_t q = 0; q < q_tiles; q++) {
+        q_offsets[q] = cursor;
+        for (uint32_t k = 0; k < q_tiles; k++)
+            if (local_pair_selected(q, k, q_tiles, keep, global_tiles))
+                k_tiles[cursor++] = k;
+    }
+    q_offsets[q_tiles] = cursor;
+    *q_offsets_out = q_offsets;
+    *k_tiles_out = k_tiles;
+    *q_tiles_out = q_tiles;
+    *pair_count_out = cursor;
+    return 1;
+}
+
+h3_veda_plan *h3_veda_plan_build_local(h3_gpu *gpu, uint32_t sequence,
+                                       uint32_t tile_size, float keep_ratio,
+                                       uint32_t global_rows,
+                                       char *error, size_t error_size) {
+    if (!gpu || !sequence || !tile_size || keep_ratio <= 0.0f ||
+        keep_ratio > 1.0f || global_rows > sequence) {
+        fail(error, error_size, "invalid Veda local-plan arguments");
+        return NULL;
+    }
+    uint32_t *q_offsets = NULL, *k_tiles = NULL;
+    uint32_t q_tiles = 0, pair_count = 0;
+    if (!h3_veda_local_pairs(sequence, tile_size, keep_ratio, global_rows,
+                             &q_offsets, &k_tiles, &q_tiles, &pair_count)) {
         fail(error, error_size, "out of memory building Veda local plan");
         return NULL;
     }
-
-    uint32_t pair_count = 0;
-    for (uint32_t q = 0; q < q_tiles; q++) {
-        q_offsets[q] = pair_count;
-        /* Always keep the diagonal tile, then expand a symmetric window. */
-        int32_t radius = (int32_t)((keep - 1u) / 2u);
-        int32_t start = (int32_t)q - radius;
-        if (start < 0) start = 0;
-        uint32_t end = (uint32_t)start + keep;
-        if (end > q_tiles) {
-            end = q_tiles;
-            start = (int32_t)(end - keep);
-            if (start < 0) start = 0;
-        }
-        for (uint32_t k = (uint32_t)start; k < end; k++)
-            k_tiles[pair_count++] = k;
-    }
-    q_offsets[q_tiles] = pair_count;
 
     h3_veda_plan *plan = plan_from_host(gpu, sequence, tile_size, q_tiles,
                                         q_offsets, k_tiles, pair_count, error,

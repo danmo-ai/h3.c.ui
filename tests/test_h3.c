@@ -3,6 +3,7 @@
 #include "h3_metal.h"
 #include "h3_safetensors.h"
 #include "h3_terminal.h"
+#include "h3_veda.h"
 
 #include <math.h>
 #include <stdint.h>
@@ -167,6 +168,42 @@ static void position_checksums(const h3_layout *layout, double sums[3],
             weighted[axis] += (double)(index + 1) * values[axis];
         }
     }
+}
+
+static int veda_has_pair(const uint32_t *offsets, const uint32_t *tiles,
+                         uint32_t q, uint32_t k) {
+    for (uint32_t pair = offsets[q]; pair < offsets[q + 1]; pair++)
+        if (tiles[pair] == k) return 1;
+    return 0;
+}
+
+static void test_veda_local_plan(void) {
+    uint32_t *offsets = NULL, *tiles = NULL, q_tiles = 0, pairs = 0;
+    /* 20 tiles of 128 rows; rows [0, 300) are text/conditions/audio. */
+    CHECK(h3_veda_local_pairs(2560, 128, 0.25f, 300, &offsets, &tiles,
+                              &q_tiles, &pairs));
+    CHECK(q_tiles == 20 && offsets[20] == pairs);
+    for (uint32_t q = 0; q < 3; q++)
+        CHECK(offsets[q + 1] - offsets[q] == 20);
+    for (uint32_t q = 3; q < 20; q++) {
+        for (uint32_t k = 0; k < 3; k++)
+            CHECK(veda_has_pair(offsets, tiles, q, k));
+        CHECK(veda_has_pair(offsets, tiles, q, q));
+        for (uint32_t pair = offsets[q] + 1; pair < offsets[q + 1]; pair++)
+            CHECK(tiles[pair - 1] < tiles[pair]);
+    }
+    CHECK(!veda_has_pair(offsets, tiles, 19, 5));
+    CHECK(offsets[11] - offsets[10] == 3 + 5);
+    free(offsets);
+    free(tiles);
+
+    CHECK(h3_veda_local_pairs(2560, 128, 0.25f, 0, &offsets, &tiles,
+                              &q_tiles, &pairs));
+    CHECK(pairs == 20 * 5 && !veda_has_pair(offsets, tiles, 19, 0));
+    free(offsets);
+    free(tiles);
+    CHECK(!h3_veda_local_pairs(2560, 128, 0.25f, 2561, &offsets, &tiles,
+                               &q_tiles, &pairs));
 }
 
 static void test_layout_tiny(void) {
@@ -428,6 +465,7 @@ int main(void) {
     test_temporal_and_canvas();
     test_schedule();
     test_dit_reuse_schedule();
+    test_veda_local_plan();
     test_layout_tiny();
     test_layout_fl2va();
     test_layout_ref2va();

@@ -1984,8 +1984,8 @@ static h3_dit *load_dit(const char *weight_directory,
                 dit->gpu, plan_path, dit->sequence, error, error_size);
         else
             dit->veda_plan = h3_veda_plan_build_local(
-                dit->gpu, dit->sequence, tile_size, keep_ratio, error,
-                error_size);
+                dit->gpu, dit->sequence, tile_size, keep_ratio,
+                dit->video_target_start, error, error_size);
         if (!dit->veda_plan) goto failed;
         fprintf(stderr,
                 "h3: Veda tile-sparse attention on (%u tiles, %u pairs, "

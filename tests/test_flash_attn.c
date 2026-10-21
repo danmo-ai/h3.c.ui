@@ -149,7 +149,7 @@ int main(void) {
     double bf16_s = now() - t0;
 
     h3_veda_plan *plan = h3_veda_plan_build_local(gpu, long_seq, 128, 0.10f,
-                                                  error, sizeof(error));
+                                                  0, error, sizeof(error));
     if (!plan) die(error);
     t0 = now();
     if (!h3_gpu_begin(gpu) ||
