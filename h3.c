@@ -881,6 +881,8 @@ static void h3_dit_progress_bridge(const char *phase, int completed, int total,
 
 static void h3_vae_progress_bridge(int completed, int total, void *opaque) {
     h3_progress_emit(opaque, "video VAE load", completed, total);
+    if (opaque && completed == total)
+        h3_phase_mark(opaque, "video VAE decode");
 }
 
 static void h3_preview_vae_progress_bridge(int completed, int total,
@@ -1887,6 +1889,14 @@ h3_result *h3_generate(h3_ctx *ctx, const char *prompt,
     free(audio);
     audio = NULL;
     if (progress.cancelled) goto cleanup;
+    const char *latent_dump = getenv("H3_DUMP_VIDEO_LATENT");
+    if (latent_dump && *latent_dump) {
+        FILE *file = fopen(latent_dump, "wb");
+        if (!file || fwrite(video, sizeof(*video), video_count, file) !=
+                video_count)
+            fprintf(stderr, "h3: cannot write %s\n", latent_dump);
+        if (file) fclose(file);
+    }
     if (!preview_decoder && ctx->cache_enabled) {
         h3_progress_emit(&progress, "video VAE load", 0, 36);
         preview_decoder = h3_acquire_video_decoder(

@@ -2409,12 +2409,23 @@ static int run_block(h3_dit *dit, unsigned index, int step,
                   error_size)) return 0;                                        \
 } while (0)
     int profile_modules = getenv("H3_PROFILE") != NULL;
+    /* H3_PROFILE_SYNC drains the GPU at each module boundary so the shares
+     * measure execution instead of host encoding. */
+    int profile_sync = profile_modules && getenv("H3_PROFILE_SYNC") != NULL;
+#define PROFILE_SYNC() do {                                                     \
+    if (profile_sync) {                                                         \
+        OP(h3_gpu_submit(dit->gpu), "profile sync");                            \
+        OP(h3_gpu_begin(dit->gpu), "profile sync");                             \
+    }                                                                           \
+} while (0)
+    PROFILE_SYNC();
     double profile_mark = profile_modules ? stream_now() : 0.0;
     if (!attention_adaln_ready)
         OP(h3_gpu_adaln_bf16(dit->gpu, dit->mod_attention, dit->hidden,
             weight->norm1, modulation, row_map, rows, HIDDEN, SLOTS,
             0, 1, 1e-5f), "DiT attention AdaLN");
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_other_seconds += stream_now() - profile_mark;
         profile_mark = stream_now();
     }
@@ -2468,6 +2479,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             1e-5f), "DiT QKV projection/norm/RoPE");
     }
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_qkv_seconds += stream_now() - profile_mark;
         profile_mark = stream_now();
     }
@@ -2499,6 +2511,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
            dit->veda ? "DiT Veda dense fallback attention" :
            "DiT full attention");
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_sdpa_seconds += stream_now() - profile_mark;
         profile_mark = stream_now();
     }
@@ -2533,6 +2546,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
              "DiT attention output LoRA");
     }
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_attn_out_seconds += stream_now() - profile_mark;
         profile_mark = stream_now();
     }
@@ -2628,6 +2642,7 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             weight->fc2, NULL, rows, FFN, HIDDEN), "DiT MLP output");
     }
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_mlp_seconds += stream_now() - profile_mark;
         profile_mark = stream_now();
     }
@@ -2663,9 +2678,11 @@ static int run_block(h3_dit *dit, unsigned index, int step,
             modulation, row_map, rows, HIDDEN, SLOTS, 5), "DiT MLP gate");
     }
     if (profile_modules) {
+        PROFILE_SYNC();
         dit->profile_other_seconds += stream_now() - profile_mark;
         dit->profile_block_count++;
     }
+#undef PROFILE_SYNC
 #undef LORA
 #undef OP
     return 1;
@@ -3689,7 +3706,7 @@ void h3_dit_free(h3_dit *dit) {
         fprintf(stderr,
                 "h3 module profile: blocks=%llu qkv=%.3fs (%.1f%%) "
                 "attn=%.3fs (%.1f%%) attn_out=%.3fs (%.1f%%) "
-                "mlp=%.3fs (%.1f%%) other=%.3fs (%.1f%%) encode-wall\n",
+                "mlp=%.3fs (%.1f%%) other=%.3fs (%.1f%%) %s\n",
                 (unsigned long long)dit->profile_block_count,
                 dit->profile_qkv_seconds,
                 total > 0 ? 100.0 * dit->profile_qkv_seconds / total : 0.0,
@@ -3700,7 +3717,8 @@ void h3_dit_free(h3_dit *dit) {
                 dit->profile_mlp_seconds,
                 total > 0 ? 100.0 * dit->profile_mlp_seconds / total : 0.0,
                 dit->profile_other_seconds,
-                total > 0 ? 100.0 * dit->profile_other_seconds / total : 0.0);
+                total > 0 ? 100.0 * dit->profile_other_seconds / total : 0.0,
+                getenv("H3_PROFILE_SYNC") ? "gpu-synced" : "encode-wall");
     }
     h3_veda_plan_free(dit->veda_plan);
     h3_gpu_free(dit->gpu);

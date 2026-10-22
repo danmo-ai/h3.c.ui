@@ -97,6 +97,42 @@ LoRA overhead).
 
 Community issue [antirez/h3.c#13](https://github.com/antirez/h3.c/issues/13) reported ~70% GPU module time in attention on PyTorch MPS; native encode shares agree that attention is the long-seq bottleneck.
 
+`H3_PROFILE=1 H3_PROFILE_SYNC=1` waits for the GPU at each module boundary,
+so the shares are GPU time rather than encode wall. 10 s 864×480 (29584
+tokens), 2 steps × 50 blocks, M5 Max:
+
+| qkv | attn | attn_out | mlp | other |
+|---:|---:|---:|---:|---:|
+| 9.3 s (7.7%) | 85.4 s (70.5%) | 3.8 s (3.2%) | 22.4 s (18.4%) | 0.3 s |
+
+Attention costs ~0.85 s per block under sustained load against 0.56 s for
+one cold MPSGraph SDPA at the same shape (45 TFLOPS); the gap is thermal
+clock reduction, measured on both battery and AC power.
+
+## Visual VAE decoder precision
+
+The ViT decoder (36 blocks, hidden 2048) ran entirely in F32 at ~7.7 TFLOPS.
+The reference disables autocast only around `x_embedder` and `proj_out`, so
+the transformer body runs with BF16 operands on CUDA. The default now keeps
+the residual stream, norms' statistics, embedding and output projection in
+F32 and feeds BF16 to the four linears and SDPA (`H3_VAE_F32=1` restores the
+F32 path). VAE-shape microbench (2028 rows): linears 19.1 → 4.4 ms per
+block, SDPA 4.44 → 0.80 ms.
+
+10 s 864×480 (243 frames, 14 temporal chunks × 8 tiles), real latent:
+
+| Path | decode | peak GPU memory | vs F32 frames |
+|---|---:|---:|---|
+| F32 | 161 s | 9.4 GiB | — |
+| BF16 operands (default) | 33–37 s | 4.8 GiB | PSNR 63.0 dB, worst frame 61.0 dB |
+
+`./h3_video_vae_bench VAE_DIR latent.f32 T H W [out] [reference]` repeats
+the comparison; `H3_DUMP_VIDEO_LATENT=path` writes the latent from a run.
+The decode was previously reported as "video VAE load" in the stage table.
+
+End-to-end 10 s 864×480 Turbo LoRA (8 steps): 690–794 s before, 657 s after
+with the denoise phase thermally limited at ~75 s/step (VAE 36 s).
+
 ## Ported paths
 
 | Path | Status | How to enable |
