@@ -515,6 +515,7 @@ h3_gpu *h3_gpu_create(const char *shader_source_path,
             [names addObject:
                 @"h3_qkv_project_split_int8_rope_local_scales_nax_r128_k5376_morton4"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128"];
+            [names addObject:@"h3_flash_attn_nax_bf16"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_nax_r128_full_k5376"];
             [names addObject:@"h3_fc1_swiglu_int8_local_nax_r128"];
@@ -577,6 +578,10 @@ void h3_gpu_free(h3_gpu *gpu) {
                     (1024.0 * 1024.0 * 1024.0));
         }
     }
+}
+
+void h3_gpu_mark_head_major_sdpa_inputs(h3_gpu *opaque) {
+    if (opaque) GPU(opaque).headMajorSDPAInputs = YES;
 }
 
 int h3_gpu_is_m5(const h3_gpu *opaque) {
@@ -1727,6 +1732,69 @@ int h3_gpu_flash_attn_bf16_head_major(
     return 1;
 }
 
+/* 64 query rows per threadgroup (four simdgroups of 16); a Veda tile must
+ * cover whole query blocks. */
+static int h3_gpu_flash_attn_nax_impl(
+                     H3GPU *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value,
+                     const h3_gpu_tensor *q_offsets,
+                     const h3_gpu_tensor *k_tiles, uint32_t tile_size,
+                     uint32_t sequence, uint32_t heads, uint32_t head_dim,
+                     float scale) {
+    size_t count = (size_t)sequence * heads * head_dim;
+    if (!gpu.tensorOpsEnabled || head_dim != 128 || !sequence || !heads ||
+        (tile_size && (tile_size % 64 || !q_offsets || !k_tiles)) ||
+        !h3_gpu_require_command(gpu) ||
+        !h3_gpu_require_bf16(gpu, query, count, @"NAX flash query") ||
+        !h3_gpu_require_bf16(gpu, key, count, @"NAX flash key") ||
+        !h3_gpu_require_bf16(gpu, value, count, @"NAX flash value") ||
+        !h3_gpu_require_bf16(gpu, output, count, @"NAX flash output"))
+        return 0;
+    id<MTLComputePipelineState> pipeline =
+        h3_gpu_pipeline(gpu, @"h3_flash_attn_nax_bf16");
+    if (!pipeline || pipeline.maxTotalThreadsPerThreadgroup < 128) {
+        h3_gpu_set_error(gpu, @"NAX flash attention pipeline unavailable");
+        return 0;
+    }
+    struct { uint32_t sequence, heads; float scale; uint32_t tile_size; }
+        args = {sequence, heads, scale, tile_size};
+    @autoreleasepool {
+        id<MTLComputeCommandEncoder> encoder =
+            [gpu.command computeCommandEncoder];
+        [encoder setComputePipelineState:pipeline];
+        [encoder setBuffer:TENSOR(query).buffer offset:0 atIndex:0];
+        [encoder setBuffer:TENSOR(key).buffer offset:0 atIndex:1];
+        [encoder setBuffer:TENSOR(value).buffer offset:0 atIndex:2];
+        [encoder setBuffer:TENSOR(output).buffer offset:0 atIndex:3];
+        [encoder setBytes:&args length:sizeof(args) atIndex:4];
+        [encoder setBuffer:TENSOR(tile_size ? q_offsets : query).buffer
+                    offset:0 atIndex:5];
+        [encoder setBuffer:TENSOR(tile_size ? k_tiles : query).buffer
+                    offset:0 atIndex:6];
+        [encoder dispatchThreadgroups:MTLSizeMake((sequence + 63) / 64,
+                                                  heads, 1)
+                 threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        [encoder endEncoding];
+    }
+    h3_gpu_stats stats = gpu.stats;
+    stats.direct_dispatches++;
+    if (tile_size) stats.sparse_attn_dispatches++;
+    else stats.flash_attn_dispatches++;
+    gpu.stats = stats;
+    return 1;
+}
+
+int h3_gpu_flash_attn_nax_bf16_head_major(
+                     h3_gpu *opaque, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale) {
+    return h3_gpu_flash_attn_nax_impl(GPU(opaque), output, query, key, value,
+                                      NULL, NULL, 0, sequence, heads,
+                                      head_dim, scale);
+}
+
 int h3_gpu_flash_attn_int8_head_major(
                      h3_gpu *opaque, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
@@ -1797,6 +1865,12 @@ int h3_gpu_sparse_attn_bf16_head_major(
         uint32_t sequence, heads, head_dim, tile_size, q_tiles;
         float scale;
     } sparse_args;
+    if (gpu.tensorOpsEnabled && head_dim == 128 && !(tile_size % 64) &&
+        !getenv("H3_DISABLE_NAX_SPARSE_ATTN") &&
+        !(gpu.headMajorSDPAInputs = NO))
+        return h3_gpu_flash_attn_nax_impl(gpu, output, query, key, value,
+                                          q_offsets, k_tiles, tile_size,
+                                          sequence, heads, head_dim, scale);
     sparse_args args = {sequence, heads, head_dim, tile_size, q_tiles, scale};
     id<MTLComputePipelineState> pipeline =
         h3_gpu_pipeline(gpu, @"h3_sparse_attn_bf16_head_major");

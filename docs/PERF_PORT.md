@@ -139,7 +139,7 @@ with the denoise phase thermally limited at ~75 s/step (VAE 36 s).
 |---|---|---|
 | BF16 streamed FlashAttention | wired, opt-in | `H3_FORCE_FLASH_ATTN=1` |
 | Online int8 FlashAttention | wired, opt-in | `H3_FORCE_FLASH_ATTN=1 H3_FORCE_INT8_FLASH_ATTN=1` |
-| Veda tile-sparse SDPA | wired | `--veda` / `!veda` (plan via local window or `H3_VEDA_PLAN`) |
+| Veda tile-sparse SDPA | TensorOps kernel on M5 | `--veda` / `!veda` / UI "Veda attention" (local window, `H3_VEDA_KEEP_RATIO` default 0.35, or `H3_VEDA_PLAN`) |
 | Morton linear split >3072 | default | automatic for TensorOps modes |
 | Offline int8 MLP weight cache | opt-in | `H3_INT8_CACHE=1` [`H3_INT8_CACHE_DIR=...`] |
 
@@ -151,6 +151,40 @@ with the denoise phase thermally limited at ~75 s/step (VAE 36 s).
 | Forced BF16 Flash | 166.9 s | 166.8 s | flash=70 |
 
 Flash is correct (`flash=70`) but not yet competitive; keep opt-in until a TensorOps / fused Flash kernel lands (Draw Things / WWDC26 direction).
+
+## TensorOps FlashAttention and Veda
+
+`h3_flash_attn_nax_bf16` follows MLX's `attention_nax`: four simdgroups of
+16 query rows, 16×32×16 simdgroup matmuls on register fragments, BK = 32,
+`max_total_threads_per_threadgroup(128)`, Q reloaded per key block (keeping
+Q resident spills: 880–1000 ms), unchecked loads except on the ragged last
+block. Dense, cold, S = 29584, 56 heads: 642–672 ms against MPSGraph's
+555–580 ms, so dense attention stays on MPSGraph.
+
+The same kernel walks a Veda CSR plan (query tile → key tiles), which
+MPSGraph cannot do. The scalar sparse kernel it replaces ran at ~3 TFLOPS
+dense-equivalent and made `--veda` slower than dense. Same shape:
+
+| keep ratio | tile pairs | sparse | MPSGraph dense |
+|---:|---:|---:|---:|
+| 0.25 | 27.8% | 191 ms | 580 ms |
+| 0.35 | 37.9% | 263 ms | 578 ms |
+| 0.5 | 52.1% | 366 ms | 602 ms |
+
+The local plan keeps text/audio rows global and a window of whole latent
+frames for video rows (1620 tokens per frame at 864×480). 10 s 864×480 Turbo
+LoRA, 8 steps, seed 7, back to back:
+
+| run | denoise | total |
+|---|---:|---:|
+| dense | 569 s | 631 s |
+| Veda 0.5 | 451 s | 512 s |
+| Veda 0.35 (default keep) | 368 s | 429 s |
+
+Sparse runs diverge from the dense sample (PSNR ~12 dB, different motion)
+but frames stay sharp and temporally coherent; the default keep ratio moved
+from 0.10 to 0.35. `h3_nax_attention_test` checks the dense kernel against
+the scalar flash kernel and the sparse path against the scalar sparse kernel.
 
 ## Veda smoke (512², 22f, 2 steps, 35 layers)
 

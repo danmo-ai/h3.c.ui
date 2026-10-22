@@ -2990,6 +2990,288 @@ kernel void h3_linear_int8_grouped_local_nax_r128x128(
         }
     }
 }
+
+/* TensorOps FlashAttention over head-major [head, row, 128] BF16, following
+ * the register-fragment design of MLX's attention_nax (MIT, Apple Inc.):
+ * each simdgroup owns 16 query rows and drives 16x32x16 simdgroup matmuls
+ * whose operands live in 16x16 fragments (8 elements per lane). */
+struct h3_flash_nax_args {
+    uint sequence;
+    uint heads;
+    float scale;
+    /* 0 for dense attention; otherwise the Veda tile edge, whose CSR plan
+     * lists the key tiles of each query tile. */
+    uint tile_size;
+};
+
+typedef vec<float, 8> h3_nax_ffrag;
+typedef vec<bfloat, 8> h3_nax_bfrag;
+
+/* Lane -> (column, row) of its first element; elements cover rows
+ * {row, row + 8} and four consecutive columns. */
+inline short2 h3_nax_coord(ushort lane) {
+    short quad = short(lane >> 2);
+    short row = (quad & 4) | short((lane >> 1) & 3);
+    short column = short(((quad & 2) | (lane & 1)) * 4);
+    return short2(column, row);
+}
+
+inline void h3_nax_load_full(thread h3_nax_bfrag &dst,
+                             device const bfloat *src, int ld, short2 coord) {
+    src += coord.y * ld + coord.x;
+    vec<bfloat, 4> lo = *(device const vec<bfloat, 4> *)src;
+    vec<bfloat, 4> hi = *(device const vec<bfloat, 4> *)(src + 8 * ld);
+    dst = h3_nax_bfrag(lo, hi);
+}
+
+inline void h3_nax_load(thread h3_nax_bfrag &dst, device const bfloat *src,
+                        int ld, short2 coord, int rows) {
+    src += coord.y * ld + coord.x;
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+        bool valid = coord.y + i * 8 < rows;
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++)
+            dst[i * 4 + j] = valid ? src[i * 8 * ld + j] : bfloat(0.0f);
+    }
+}
+
+template <typename A, typename B>
+inline void h3_nax_mma(thread h3_nax_ffrag &c0, thread h3_nax_ffrag &c1,
+                       thread const vec<A, 8> &a,
+                       thread const h3_nax_bfrag &b0,
+                       thread const h3_nax_bfrag &b1,
+                       bool_constant<false>) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<A, B, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<A, B, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(ct_a)>,
+        remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+template <typename A, typename B>
+inline void h3_nax_mma(thread h3_nax_ffrag &c0, thread h3_nax_ffrag &c1,
+                       thread const vec<A, 8> &a,
+                       thread const h3_nax_bfrag &b0,
+                       thread const h3_nax_bfrag &b1,
+                       bool_constant<true>) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<A, B, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<A, B, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(ct_a)>,
+        remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+/* Row statistic over one fragment: combine its four columns, then the lanes
+ * sharing the row (lane bits 0 and 3 select columns). */
+inline float h3_nax_row_max(thread const h3_nax_ffrag &f, short i) {
+    float v = max(max(f[i * 4], f[i * 4 + 1]), max(f[i * 4 + 2], f[i * 4 + 3]));
+    v = max(v, simd_shuffle_xor(v, ushort(1)));
+    return max(v, simd_shuffle_xor(v, ushort(8)));
+}
+
+inline float h3_nax_row_sum(thread const h3_nax_ffrag &f, short i) {
+    float v = (f[i * 4] + f[i * 4 + 1]) + (f[i * 4 + 2] + f[i * 4 + 3]);
+    v += simd_shuffle_xor(v, ushort(1));
+    return v + simd_shuffle_xor(v, ushort(8));
+}
+
+template <short BK, short WM>
+[[kernel, max_total_threads_per_threadgroup(WM * 32)]]
+void h3_flash_attn_nax_bf16_impl(
+                           device const bfloat *query [[buffer(0)]],
+                           device const bfloat *key [[buffer(1)]],
+                           device const bfloat *value [[buffer(2)]],
+                           device bfloat *output [[buffer(3)]],
+                           constant h3_flash_nax_args &args [[buffer(4)]],
+                           device const uint *q_offsets [[buffer(5)]],
+                           device const uint *k_tiles [[buffer(6)]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr short D = 128;
+    constexpr short TD = D / 16;
+    constexpr short TK = BK / 16;
+    const int sequence = int(args.sequence);
+    const size_t head = (size_t)group.y * (size_t)sequence * D;
+    const int q_row = int(group.x) * (WM * 16) + int(simdgroup) * 16;
+    const int q_rows = sequence - q_row;
+    const short2 coord = h3_nax_coord(lane);
+    const float scale2 = args.scale * 1.44269504089f;
+    device const bfloat *q = query + head + (size_t)max(q_row, 0) * D;
+    device const bfloat *k = key + head;
+    device const bfloat *v = value + head;
+
+    const bool q_partial = q_rows < 16;
+    h3_nax_ffrag o_frag[TD];
+    #pragma clang loop unroll(full)
+    for (short d = 0; d < TD; d++) o_frag[d] = h3_nax_ffrag(0.0f);
+    float row_max[2] = {-FLT_MAX, -FLT_MAX};
+    float row_sum[2] = {0.0f, 0.0f};
+
+    const uint tile = args.tile_size;
+    uint pair_begin = 0, pair_end = 1;
+    if (tile) {
+        uint q_tile = group.x * uint(WM * 16) / tile;
+        pair_begin = q_offsets[q_tile];
+        pair_end = q_offsets[q_tile + 1];
+    }
+    for (uint pair = pair_begin; pair < pair_end; pair++) {
+    const int tile_start = tile ? int(k_tiles[pair] * tile) : 0;
+    const int tile_stop = tile ? min(tile_start + int(tile), sequence) :
+                                 sequence;
+    for (int k_row = tile_start; k_row < tile_stop; k_row += BK) {
+        const int k_rows = sequence - k_row;
+        const bool last = k_rows < BK;
+        h3_nax_ffrag s_frag[TK];
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t++) s_frag[t] = h3_nax_ffrag(0.0f);
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t += 2) {
+            #pragma clang loop unroll_count(4)
+            for (short d = 0; d < TD; d++) {
+                h3_nax_bfrag q_frag, k0, k1;
+                if (q_partial)
+                    h3_nax_load(q_frag, q + d * 16, D, coord, q_rows);
+                else
+                    h3_nax_load_full(q_frag, q + d * 16, D, coord);
+                device const bfloat *src = k + (size_t)(k_row + t * 16) * D +
+                                           d * 16;
+                if (last) {
+                    h3_nax_load(k0, src, D, coord, k_rows - t * 16);
+                    h3_nax_load(k1, src + 16 * D, D, coord,
+                                k_rows - t * 16 - 16);
+                } else {
+                    h3_nax_load_full(k0, src, D, coord);
+                    h3_nax_load_full(k1, src + 16 * D, D, coord);
+                }
+                h3_nax_mma<bfloat, bfloat>(s_frag[t], s_frag[t + 1],
+                                           q_frag, k0, k1,
+                                           bool_constant<true>());
+            }
+        }
+        if (last) {
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) {
+                #pragma clang loop unroll(full)
+                for (short e = 0; e < 8; e++)
+                    if (t * 16 + coord.x + (e & 3) >= k_rows)
+                        s_frag[t][e] = -FLT_MAX;
+            }
+        }
+        /* Scores stay unscaled; scale2 > 0 so the scaled row maximum is the
+         * raw maximum times scale2, folded into the exp2 argument. */
+        float factor[2], bias[2];
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            float m = -FLT_MAX;
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) m = max(m, h3_nax_row_max(s_frag[t], i));
+            m = max(row_max[i], m * scale2);
+            factor[i] = fast::exp2(row_max[i] - m);
+            row_max[i] = m;
+            bias[i] = -m;
+        }
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t++) {
+            #pragma clang loop unroll(full)
+            for (short e = 0; e < 8; e++)
+                s_frag[t][e] = fast::exp2(fma(s_frag[t][e], scale2,
+                                              bias[e >> 2]));
+        }
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            float sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) sum += h3_nax_row_sum(s_frag[t], i);
+            row_sum[i] = row_sum[i] * factor[i] + sum;
+        }
+        /* Once the row maxima settle every factor is exactly 1. */
+        if (!simd_all(factor[0] == 1.0f && factor[1] == 1.0f)) {
+            #pragma clang loop unroll(full)
+            for (short d = 0; d < TD; d++) {
+                #pragma clang loop unroll(full)
+                for (short e = 0; e < 8; e++) o_frag[d][e] *= factor[e >> 2];
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (short d = 0; d < TD; d += 2) {
+            if (d == 4) threadgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) {
+                h3_nax_bfrag v0, v1;
+                device const bfloat *src = v + (size_t)(k_row + t * 16) * D +
+                                           d * 16;
+                if (last) {
+                    h3_nax_load(v0, src, D, coord, k_rows - t * 16);
+                    h3_nax_load(v1, src + 16, D, coord, k_rows - t * 16);
+                } else {
+                    h3_nax_load_full(v0, src, D, coord);
+                    h3_nax_load_full(v1, src + 16, D, coord);
+                }
+                h3_nax_mma<float, bfloat>(o_frag[d], o_frag[d + 1],
+                                          s_frag[t], v0, v1,
+                                          bool_constant<false>());
+            }
+        }
+    }
+    }
+    if (q_rows <= 0) return;
+    device bfloat *out = output + head + (size_t)q_row * D;
+    float inverse[2] = {1.0f / row_sum[0], 1.0f / row_sum[1]};
+    #pragma clang loop unroll(full)
+    for (short d = 0; d < TD; d++) {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            int row = coord.y + i * 8;
+            if (row >= q_rows) continue;
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; j++)
+                out[row * D + d * 16 + coord.x + j] =
+                    bfloat(o_frag[d][i * 4 + j] * inverse[i]);
+        }
+    }
+}
+
+typedef decltype(h3_flash_attn_nax_bf16_impl<32, 4>) h3_flash_attn_nax_bf16_t;
+template [[host_name("h3_flash_attn_nax_bf16")]]
+kernel h3_flash_attn_nax_bf16_t h3_flash_attn_nax_bf16_impl<32, 4>;
 #endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],
