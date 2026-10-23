@@ -195,6 +195,25 @@ int h3_gpu_video_qkv_rope_f32(h3_gpu *gpu, h3_gpu_tensor *query,
                               uint32_t sequence, uint32_t heads,
                               uint32_t head_dim, uint32_t rope_half,
                               float epsilon);
+/* Mixed-precision visual VAE helpers: the residual stream stays F32 while the
+ * matmul and attention operands are BF16, as under CUDA autocast. */
+int h3_gpu_video_qkv_rope_bf16(h3_gpu *gpu, h3_gpu_tensor *query,
+                               h3_gpu_tensor *key, h3_gpu_tensor *value,
+                               const h3_gpu_tensor *qkv,
+                               const h3_gpu_tensor *rope_cos,
+                               const h3_gpu_tensor *rope_sin,
+                               uint32_t sequence, uint32_t heads,
+                               uint32_t head_dim, uint32_t rope_half,
+                               float epsilon);
+int h3_gpu_rms_norm_f32_to_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                const h3_gpu_tensor *input,
+                                const h3_gpu_tensor *weight, uint32_t rows,
+                                uint32_t width, float epsilon);
+int h3_gpu_scale_add_bf16_branch_f32(h3_gpu *gpu, h3_gpu_tensor *output,
+                                     const h3_gpu_tensor *residual,
+                                     const h3_gpu_tensor *branch,
+                                     const h3_gpu_tensor *scale,
+                                     uint32_t rows, uint32_t width);
 
 /* H3 AudioVAE uses time-major [batch,length,channels] activations and stores
  * Conv1d/ConvTranspose1d weights in PyTorch OIK/IOK order respectively. */
@@ -359,6 +378,37 @@ int h3_gpu_mlp_int8_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                          int use_slower_dynamic_fc1_k,
                          int use_int8_row_fc2,
                          int input_is_quantized);
+/* int8 MLP with a run-time LoRA update for FC1 ([rows, 2 * hidden_dim],
+ * gate then up) added before SwiGLU. */
+int h3_gpu_mlp_int8_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                              h3_gpu_tensor *activated,
+                              h3_gpu_tensor *quantized_activation,
+                              h3_gpu_tensor *activation_scales,
+                              const h3_gpu_tensor *input,
+                              const h3_gpu_tensor *fc1_weight,
+                              const h3_gpu_tensor *fc1_scales,
+                              const h3_gpu_tensor *fc2_weight,
+                              const h3_gpu_tensor *fc2_scales,
+                              const h3_gpu_tensor *fc1_delta,
+                              uint32_t rows, uint32_t input_dim,
+                              uint32_t hidden_dim, uint32_t output_dim,
+                              int use_slower_grouped_quantizer,
+                              int use_slower_dynamic_fc1_k,
+                              int use_int8_row_fc2);
+/* Unmerged low-rank update: delta = (input A^T) B^T with A [rank, input_dim]
+ * and B [output_dim, rank]; the rank activation is stored as BF16. */
+int h3_gpu_lora_bf16(h3_gpu *gpu, h3_gpu_tensor *delta,
+                     h3_gpu_tensor *rank_scratch,
+                     const h3_gpu_tensor *input,
+                     const h3_gpu_tensor *lora_a,
+                     const h3_gpu_tensor *lora_b, uint32_t rows,
+                     uint32_t input_dim, uint32_t rank,
+                     uint32_t output_dim);
+/* [heads, rows, head_dim] -> [rows, heads * head_dim]. */
+int h3_gpu_head_major_to_rows_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
+                                   const h3_gpu_tensor *input,
+                                   uint32_t rows, uint32_t heads,
+                                   uint32_t head_dim);
 int h3_gpu_silu_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *input, uint32_t elements);
 int h3_gpu_rms_norm_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
@@ -498,6 +548,29 @@ int h3_gpu_grouped_qkv_linear_rope_int8(
                                  int use_slower_unfused_qkv_rope,
                                  int use_slower_scalar_qkv_rms,
                                  int use_slower_uncached_int8_scales);
+/* Same projection with a run-time LoRA update added before Q/K norm and
+ * RoPE; delta is row-major [rows, 3 * heads * head_dim] in checkpoint order. */
+int h3_gpu_grouped_qkv_linear_rope_int8_lora(
+                                 h3_gpu *gpu,
+                                 h3_gpu_tensor *query,
+                                 h3_gpu_tensor *key,
+                                 h3_gpu_tensor *value,
+                                 h3_gpu_tensor *quantized_input,
+                                 h3_gpu_tensor *input_scales,
+                                 const h3_gpu_tensor *input,
+                                 const h3_gpu_tensor *weight,
+                                 const h3_gpu_tensor *weight_scales,
+                                 const h3_gpu_tensor *q_norm,
+                                 const h3_gpu_tensor *k_norm,
+                                 const h3_gpu_tensor *rope_cos,
+                                 const h3_gpu_tensor *rope_sin,
+                                 const h3_gpu_tensor *delta,
+                                 uint32_t rows, uint32_t input_dim,
+                                 uint32_t heads, uint32_t head_dim,
+                                 uint32_t rope_half, float epsilon,
+                                 int use_slower_unfused_qkv_rope,
+                                 int use_slower_scalar_qkv_rms,
+                                 int use_slower_uncached_int8_scales);
 int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
@@ -505,6 +578,15 @@ int h3_gpu_sdpa_bf16(h3_gpu *gpu, h3_gpu_tensor *output,
 /* Preserve SDPA's native [head,row,dimension] output for an immediately
  * following layout-aware projection. */
 int h3_gpu_sdpa_bf16_head_major_output(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale);
+/* Declare the next SDPA's Q/K/V as head-major [head,row,dimension], as the
+ * int8 QKV projection leaves them. */
+void h3_gpu_mark_head_major_sdpa_inputs(h3_gpu *gpu);
+/* M5 TensorOps FlashAttention over head-major Q/K/V/output (head_dim 128). */
+int h3_gpu_flash_attn_nax_bf16_head_major(
                      h3_gpu *gpu, h3_gpu_tensor *output,
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,

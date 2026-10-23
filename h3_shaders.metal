@@ -352,6 +352,96 @@ kernel void h3_video_qkv_rope_f32(
     value[output_index] = qkv[base + args.head_dim * 2 + dimension];
 }
 
+/* One simdgroup per (row, head): the per-head RMS is reduced once instead of
+ * being recomputed by every output lane. */
+kernel void h3_video_qkv_rope_bf16(
+                            device const ushort *qkv [[buffer(0)]],
+                            device const float *rope_cos [[buffer(1)]],
+                            device const float *rope_sin [[buffer(2)]],
+                            device ushort *query [[buffer(3)]],
+                            device ushort *key [[buffer(4)]],
+                            device ushort *value [[buffer(5)]],
+                            constant qkv_args &args [[buffer(6)]],
+                            uint group [[threadgroup_position_in_grid]],
+                            uint lane [[thread_index_in_simdgroup]]) {
+    uint head = group % args.heads;
+    uint row = group / args.heads;
+    if (row >= args.sequence) return;
+    uint base = (row * args.heads + head) * args.head_dim * 3;
+    float q_sum = 0.0f, k_sum = 0.0f;
+    for (uint d = lane; d < args.head_dim; d += 32) {
+        float q = h3_bf16_to_f32(qkv[base + d]);
+        float k = h3_bf16_to_f32(qkv[base + args.head_dim + d]);
+        q_sum = fma(q, q, q_sum);
+        k_sum = fma(k, k, k_sum);
+    }
+    float qi = rsqrt(simd_sum(q_sum) / float(args.head_dim) + args.epsilon);
+    float ki = rsqrt(simd_sum(k_sum) / float(args.head_dim) + args.epsilon);
+    uint output_base = (row * args.heads + head) * args.head_dim;
+    for (uint dimension = lane; dimension < args.head_dim; dimension += 32) {
+        float q0 = h3_bf16_to_f32(qkv[base + dimension]) * qi;
+        float k0 = h3_bf16_to_f32(qkv[base + args.head_dim + dimension]) * ki;
+        if (dimension < args.rope_half * 2) {
+            bool first = dimension < args.rope_half;
+            uint pair = first ? dimension + args.rope_half :
+                                dimension - args.rope_half;
+            uint frequency = first ? dimension : pair;
+            float q1 = h3_bf16_to_f32(qkv[base + pair]) * qi;
+            float k1 = h3_bf16_to_f32(qkv[base + args.head_dim + pair]) * ki;
+            float c = rope_cos[row * args.rope_half + frequency];
+            float s = rope_sin[row * args.rope_half + frequency];
+            float sign = first ? -1.0f : 1.0f;
+            q0 = q0 * c + sign * q1 * s;
+            k0 = k0 * c + sign * k1 * s;
+        }
+        query[output_base + dimension] = h3_f32_to_bf16(q0);
+        key[output_base + dimension] = h3_f32_to_bf16(k0);
+        value[output_base + dimension] = qkv[base + args.head_dim * 2 + dimension];
+    }
+}
+
+kernel void h3_rms_norm_f32_to_bf16(device const float *input [[buffer(0)]],
+                            device const float *weight [[buffer(1)]],
+                            device ushort *output [[buffer(2)]],
+                            constant norm_args &args [[buffer(3)]],
+                            uint3 group [[threadgroup_position_in_grid]],
+                            uint3 thread_position [[thread_position_in_threadgroup]],
+                            uint3 threadgroup_size [[threads_per_threadgroup]]) {
+    uint row = group.x;
+    uint tid = thread_position.x;
+    uint threads = threadgroup_size.x;
+    if (row >= args.rows) return;
+    threadgroup float reductions[256];
+    device const float *x = input + row * args.width;
+    float local_sum = 0.0f;
+    for (uint k = tid; k < args.width; k += threads)
+        local_sum = fma(x[k], x[k], local_sum);
+    reductions[tid] = local_sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = threads / 2; stride; stride >>= 1) {
+        if (tid < stride) reductions[tid] += reductions[tid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    float inverse = rsqrt(reductions[0] / float(args.width) + args.epsilon);
+    for (uint column = tid; column < args.width; column += threads)
+        output[row * args.width + column] =
+            h3_f32_to_bf16(x[column] * inverse * weight[column]);
+}
+
+kernel void h3_scale_add_bf16_branch_f32(device const float *residual [[buffer(0)]],
+                             device const ushort *branch [[buffer(1)]],
+                             device const float *scale [[buffer(2)]],
+                             device float *output [[buffer(3)]],
+                             constant scale_add_args &args [[buffer(4)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    uint column = gid.x;
+    uint row = gid.y;
+    if (row >= args.rows || column >= args.width) return;
+    uint index = row * args.width + column;
+    output[index] = residual[index] +
+        h3_bf16_to_f32(branch[index]) * scale[column];
+}
+
 struct adaln_args {
     uint rows;
     uint width;
@@ -580,6 +670,7 @@ kernel void h3_vae_encoder_group_norm_silu_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float mean = reductions[0] / float(elements);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     local = 0.0f;
     for (uint index = tid; index < elements; index += threadgroup_size.x) {
         uint spatial = index / channels_per_group;
@@ -1014,6 +1105,19 @@ struct h3_qkv_project_rope_args {
     uint head_major;
     float epsilon;
 };
+
+/* head_major bit 8 marks a run-time LoRA update stored row-major in
+ * checkpoint column order ([rows, heads * 3 * head_dim]), added before the
+ * Q/K norm and RoPE epilogue. */
+constant uint H3_QKV_LORA_DELTA = 8u;
+
+inline float h3_qkv_delta(device const bfloat *delta,
+                          constant h3_qkv_project_rope_args &args,
+                          uint row, uint checkpoint_column) {
+    if (!(args.head_major & H3_QKV_LORA_DELTA)) return 0.0f;
+    return (float)delta[row * (args.heads * args.head_dim * 3u) +
+                        checkpoint_column];
+}
 
 /* Preserve the successful direct 128x64 TensorOps matmul, but route each
  * grouped checkpoint tile directly to its Q, K, or V destination. The six
@@ -1702,6 +1806,7 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
                            device bfloat *value [[buffer(6)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(7)]],
+                           device const bfloat *delta [[buffer(8)]],
                            uint code [[threadgroup_position_in_grid]]) {
     constexpr uint TILE = 128;
     constexpr uint STREAMS = 3;
@@ -1748,7 +1853,9 @@ kernel void h3_qkv_project_split_int8_nax_r128_morton4(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * input_scales[row] *
-                         weight_scales[checkpoint_column + column]);
+                         weight_scales[checkpoint_column + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
 }
 
@@ -1773,6 +1880,7 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(
                            device const bfloat *rope_sin [[buffer(10)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(11)]],
+                           device const bfloat *delta [[buffer(12)]],
                            uint code [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
@@ -1823,7 +1931,9 @@ kernel void h3_qkv_project_split_int8_rope_nax_r128_morton4_impl(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * input_scales[row] *
-                         weight_scales[checkpoint_column + column]);
+                         weight_scales[checkpoint_column + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
     if (stream < 2) {
         threadgroup float inverse[TILE];
@@ -1961,6 +2071,7 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4_impl(
                            device const bfloat *rope_sin [[buffer(10)]],
                            constant h3_qkv_project_rope_args &args
                                [[buffer(11)]],
+                           device const bfloat *delta [[buffer(12)]],
                            uint code [[threadgroup_position_in_grid]],
                            uint tid [[thread_index_in_threadgroup]]) {
     constexpr uint TILE = 128;
@@ -2016,7 +2127,9 @@ kernel void h3_qkv_project_split_int8_rope_local_scales_nax_r128_morton4_impl(
         if (row < args.rows)
             destination[row * TILE + column] =
                 (bfloat)((float)accum[element] * scratch[(uint)index[1]] *
-                         scratch[TILE + column]);
+                         scratch[TILE + column] +
+                         h3_qkv_delta(delta, args, row,
+                                      checkpoint_column + column));
     }
     if (stream < 2) {
         device const bfloat *norm_weight = stream == 0 ? q_weight : k_weight;
@@ -2150,6 +2263,7 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
                            device const float *weight_scales [[buffer(3)]],
                            device bfloat *output [[buffer(4)]],
                            constant linear_args &args [[buffer(5)]],
+                           device const bfloat *delta [[buffer(6)]],
                            uint code [[threadgroup_position_in_grid]]) {
     constexpr uint TILE = 128;
     uint padded_rows = (args.rows + TILE - 1) & ~(TILE - 1);
@@ -2161,6 +2275,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
     uint column_start = group.y * TILE;
     uint input_dim = INPUT_DIM ? INPUT_DIM : args.input_dim;
     constexpr bool FULL_PRODUCT = INPUT_DIM != 0 && K_TILE == INPUT_DIM;
+    /* has_bias marks a run-time LoRA update laid out as [rows, 2 * FFN]. */
+    bool has_delta = args.has_bias != 0;
     auto x = tensor<device int8_t, dextents<int32_t, 2>, tensor_inline>(
         input, dextents<int32_t, 2>((int)input_dim,
                                     (int)padded_rows));
@@ -2204,6 +2320,8 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
             uint column = column_start + (uint)index[0];
             float value = (float)accum[element] * input_scales[row] *
                           weight_scales[column];
+            if (has_delta && row < args.rows)
+                value += (float)delta[row * args.output_dim * 2 + column];
             gate_tile[(uint)index[1] * TILE + (uint)index[0]] =
                 (bfloat)value;
         }
@@ -2246,6 +2364,9 @@ kernel void h3_fc1_swiglu_int8_nax_r128_impl(
             float gate = (float)gate_tile[local];
             float up = (float)accum[element] * input_scales[row] *
                        weight_scales[args.output_dim + column];
+            if (has_delta)
+                up = (float)(bfloat)(up + (float)delta[
+                    row * args.output_dim * 2 + args.output_dim + column]);
             output[row * args.output_dim + column] =
                 (bfloat)(gate / (1.0f + exp(-gate)) * up);
         }
@@ -2869,6 +2990,288 @@ kernel void h3_linear_int8_grouped_local_nax_r128x128(
         }
     }
 }
+
+/* TensorOps FlashAttention over head-major [head, row, 128] BF16, following
+ * the register-fragment design of MLX's attention_nax (MIT, Apple Inc.):
+ * each simdgroup owns 16 query rows and drives 16x32x16 simdgroup matmuls
+ * whose operands live in 16x16 fragments (8 elements per lane). */
+struct h3_flash_nax_args {
+    uint sequence;
+    uint heads;
+    float scale;
+    /* 0 for dense attention; otherwise the Veda tile edge, whose CSR plan
+     * lists the key tiles of each query tile. */
+    uint tile_size;
+};
+
+typedef vec<float, 8> h3_nax_ffrag;
+typedef vec<bfloat, 8> h3_nax_bfrag;
+
+/* Lane -> (column, row) of its first element; elements cover rows
+ * {row, row + 8} and four consecutive columns. */
+inline short2 h3_nax_coord(ushort lane) {
+    short quad = short(lane >> 2);
+    short row = (quad & 4) | short((lane >> 1) & 3);
+    short column = short(((quad & 2) | (lane & 1)) * 4);
+    return short2(column, row);
+}
+
+inline void h3_nax_load_full(thread h3_nax_bfrag &dst,
+                             device const bfloat *src, int ld, short2 coord) {
+    src += coord.y * ld + coord.x;
+    vec<bfloat, 4> lo = *(device const vec<bfloat, 4> *)src;
+    vec<bfloat, 4> hi = *(device const vec<bfloat, 4> *)(src + 8 * ld);
+    dst = h3_nax_bfrag(lo, hi);
+}
+
+inline void h3_nax_load(thread h3_nax_bfrag &dst, device const bfloat *src,
+                        int ld, short2 coord, int rows) {
+    src += coord.y * ld + coord.x;
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 2; i++) {
+        bool valid = coord.y + i * 8 < rows;
+        #pragma clang loop unroll(full)
+        for (short j = 0; j < 4; j++)
+            dst[i * 4 + j] = valid ? src[i * 8 * ld + j] : bfloat(0.0f);
+    }
+}
+
+template <typename A, typename B>
+inline void h3_nax_mma(thread h3_nax_ffrag &c0, thread h3_nax_ffrag &c1,
+                       thread const vec<A, 8> &a,
+                       thread const h3_nax_bfrag &b0,
+                       thread const h3_nax_bfrag &b1,
+                       bool_constant<false>) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, false, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<A, B, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<A, B, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(ct_a)>,
+        remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+template <typename A, typename B>
+inline void h3_nax_mma(thread h3_nax_ffrag &c0, thread h3_nax_ffrag &c1,
+                       thread const vec<A, 8> &a,
+                       thread const h3_nax_bfrag &b0,
+                       thread const h3_nax_bfrag &b1,
+                       bool_constant<true>) {
+    constexpr auto desc = matmul2d_descriptor(
+        16, 32, 16, false, true, true,
+        matmul2d_descriptor::mode::multiply_accumulate);
+    matmul2d<desc, execution_simdgroup> op;
+    auto ct_a = op.template get_left_input_cooperative_tensor<A, B, float>();
+    auto ct_b = op.template get_right_input_cooperative_tensor<A, B, float>();
+    auto ct_c = op.template get_destination_cooperative_tensor<
+        remove_addrspace_t<decltype(ct_a)>,
+        remove_addrspace_t<decltype(ct_b)>, float>();
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        ct_a[i] = a[i];
+        ct_b[i] = b0[i];
+        ct_b[8 + i] = b1[i];
+        ct_c[i] = c0[i];
+        ct_c[8 + i] = c1[i];
+    }
+    op.run(ct_a, ct_b, ct_c);
+    #pragma clang loop unroll(full)
+    for (short i = 0; i < 8; i++) {
+        c0[i] = ct_c[i];
+        c1[i] = ct_c[8 + i];
+    }
+}
+
+/* Row statistic over one fragment: combine its four columns, then the lanes
+ * sharing the row (lane bits 0 and 3 select columns). */
+inline float h3_nax_row_max(thread const h3_nax_ffrag &f, short i) {
+    float v = max(max(f[i * 4], f[i * 4 + 1]), max(f[i * 4 + 2], f[i * 4 + 3]));
+    v = max(v, simd_shuffle_xor(v, ushort(1)));
+    return max(v, simd_shuffle_xor(v, ushort(8)));
+}
+
+inline float h3_nax_row_sum(thread const h3_nax_ffrag &f, short i) {
+    float v = (f[i * 4] + f[i * 4 + 1]) + (f[i * 4 + 2] + f[i * 4 + 3]);
+    v += simd_shuffle_xor(v, ushort(1));
+    return v + simd_shuffle_xor(v, ushort(8));
+}
+
+template <short BK, short WM>
+[[kernel, max_total_threads_per_threadgroup(WM * 32)]]
+void h3_flash_attn_nax_bf16_impl(
+                           device const bfloat *query [[buffer(0)]],
+                           device const bfloat *key [[buffer(1)]],
+                           device const bfloat *value [[buffer(2)]],
+                           device bfloat *output [[buffer(3)]],
+                           constant h3_flash_nax_args &args [[buffer(4)]],
+                           device const uint *q_offsets [[buffer(5)]],
+                           device const uint *k_tiles [[buffer(6)]],
+                           ushort lane [[thread_index_in_simdgroup]],
+                           ushort simdgroup [[simdgroup_index_in_threadgroup]],
+                           uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr short D = 128;
+    constexpr short TD = D / 16;
+    constexpr short TK = BK / 16;
+    const int sequence = int(args.sequence);
+    const size_t head = (size_t)group.y * (size_t)sequence * D;
+    const int q_row = int(group.x) * (WM * 16) + int(simdgroup) * 16;
+    const int q_rows = sequence - q_row;
+    const short2 coord = h3_nax_coord(lane);
+    const float scale2 = args.scale * 1.44269504089f;
+    device const bfloat *q = query + head + (size_t)max(q_row, 0) * D;
+    device const bfloat *k = key + head;
+    device const bfloat *v = value + head;
+
+    const bool q_partial = q_rows < 16;
+    h3_nax_ffrag o_frag[TD];
+    #pragma clang loop unroll(full)
+    for (short d = 0; d < TD; d++) o_frag[d] = h3_nax_ffrag(0.0f);
+    float row_max[2] = {-FLT_MAX, -FLT_MAX};
+    float row_sum[2] = {0.0f, 0.0f};
+
+    const uint tile = args.tile_size;
+    uint pair_begin = 0, pair_end = 1;
+    if (tile) {
+        uint q_tile = group.x * uint(WM * 16) / tile;
+        pair_begin = q_offsets[q_tile];
+        pair_end = q_offsets[q_tile + 1];
+    }
+    for (uint pair = pair_begin; pair < pair_end; pair++) {
+    const int tile_start = tile ? int(k_tiles[pair] * tile) : 0;
+    const int tile_stop = tile ? min(tile_start + int(tile), sequence) :
+                                 sequence;
+    for (int k_row = tile_start; k_row < tile_stop; k_row += BK) {
+        const int k_rows = sequence - k_row;
+        const bool last = k_rows < BK;
+        h3_nax_ffrag s_frag[TK];
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t++) s_frag[t] = h3_nax_ffrag(0.0f);
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t += 2) {
+            #pragma clang loop unroll_count(4)
+            for (short d = 0; d < TD; d++) {
+                h3_nax_bfrag q_frag, k0, k1;
+                if (q_partial)
+                    h3_nax_load(q_frag, q + d * 16, D, coord, q_rows);
+                else
+                    h3_nax_load_full(q_frag, q + d * 16, D, coord);
+                device const bfloat *src = k + (size_t)(k_row + t * 16) * D +
+                                           d * 16;
+                if (last) {
+                    h3_nax_load(k0, src, D, coord, k_rows - t * 16);
+                    h3_nax_load(k1, src + 16 * D, D, coord,
+                                k_rows - t * 16 - 16);
+                } else {
+                    h3_nax_load_full(k0, src, D, coord);
+                    h3_nax_load_full(k1, src + 16 * D, D, coord);
+                }
+                h3_nax_mma<bfloat, bfloat>(s_frag[t], s_frag[t + 1],
+                                           q_frag, k0, k1,
+                                           bool_constant<true>());
+            }
+        }
+        if (last) {
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) {
+                #pragma clang loop unroll(full)
+                for (short e = 0; e < 8; e++)
+                    if (t * 16 + coord.x + (e & 3) >= k_rows)
+                        s_frag[t][e] = -FLT_MAX;
+            }
+        }
+        /* Scores stay unscaled; scale2 > 0 so the scaled row maximum is the
+         * raw maximum times scale2, folded into the exp2 argument. */
+        float factor[2], bias[2];
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            float m = -FLT_MAX;
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) m = max(m, h3_nax_row_max(s_frag[t], i));
+            m = max(row_max[i], m * scale2);
+            factor[i] = fast::exp2(row_max[i] - m);
+            row_max[i] = m;
+            bias[i] = -m;
+        }
+        #pragma clang loop unroll(full)
+        for (short t = 0; t < TK; t++) {
+            #pragma clang loop unroll(full)
+            for (short e = 0; e < 8; e++)
+                s_frag[t][e] = fast::exp2(fma(s_frag[t][e], scale2,
+                                              bias[e >> 2]));
+        }
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            float sum = 0.0f;
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) sum += h3_nax_row_sum(s_frag[t], i);
+            row_sum[i] = row_sum[i] * factor[i] + sum;
+        }
+        /* Once the row maxima settle every factor is exactly 1. */
+        if (!simd_all(factor[0] == 1.0f && factor[1] == 1.0f)) {
+            #pragma clang loop unroll(full)
+            for (short d = 0; d < TD; d++) {
+                #pragma clang loop unroll(full)
+                for (short e = 0; e < 8; e++) o_frag[d][e] *= factor[e >> 2];
+            }
+        }
+        #pragma clang loop unroll(full)
+        for (short d = 0; d < TD; d += 2) {
+            if (d == 4) threadgroup_barrier(mem_flags::mem_none);
+            #pragma clang loop unroll(full)
+            for (short t = 0; t < TK; t++) {
+                h3_nax_bfrag v0, v1;
+                device const bfloat *src = v + (size_t)(k_row + t * 16) * D +
+                                           d * 16;
+                if (last) {
+                    h3_nax_load(v0, src, D, coord, k_rows - t * 16);
+                    h3_nax_load(v1, src + 16, D, coord, k_rows - t * 16);
+                } else {
+                    h3_nax_load_full(v0, src, D, coord);
+                    h3_nax_load_full(v1, src + 16, D, coord);
+                }
+                h3_nax_mma<float, bfloat>(o_frag[d], o_frag[d + 1],
+                                          s_frag[t], v0, v1,
+                                          bool_constant<false>());
+            }
+        }
+    }
+    }
+    if (q_rows <= 0) return;
+    device bfloat *out = output + head + (size_t)q_row * D;
+    float inverse[2] = {1.0f / row_sum[0], 1.0f / row_sum[1]};
+    #pragma clang loop unroll(full)
+    for (short d = 0; d < TD; d++) {
+        #pragma clang loop unroll(full)
+        for (short i = 0; i < 2; i++) {
+            int row = coord.y + i * 8;
+            if (row >= q_rows) continue;
+            #pragma clang loop unroll(full)
+            for (short j = 0; j < 4; j++)
+                out[row * D + d * 16 + coord.x + j] =
+                    bfloat(o_frag[d][i * 4 + j] * inverse[i]);
+        }
+    }
+}
+
+typedef decltype(h3_flash_attn_nax_bf16_impl<32, 4>) h3_flash_attn_nax_bf16_t;
+template [[host_name("h3_flash_attn_nax_bf16")]]
+kernel h3_flash_attn_nax_bf16_t h3_flash_attn_nax_bf16_impl<32, 4>;
 #endif
 
 kernel void h3_silu_bf16(device const ushort *input [[buffer(0)]],
@@ -4010,6 +4413,7 @@ kernel void h3_gqa_causal_bf16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     float maximum = reductions[0];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     float local_sum = 0.0f;
     for (uint key_row = tid; key_row < key_count; key_row += threads) {
         float probability = exp(scores[key_row] - maximum);
@@ -4060,6 +4464,26 @@ kernel void h3_add_bf16(device const ushort *left [[buffer(0)]],
     if (gid >= count) return;
     output[gid] = h3_f32_to_bf16(h3_bf16_to_f32(left[gid]) +
                                   h3_bf16_to_f32(right[gid]));
+}
+
+struct h3_head_major_rows_args {
+    uint rows;
+    uint heads;
+    uint head_dim;
+};
+
+kernel void h3_head_major_to_rows_bf16(
+                         device const ushort *input [[buffer(0)]],
+                         device ushort *output [[buffer(1)]],
+                         constant h3_head_major_rows_args &args [[buffer(2)]],
+                         uint gid [[thread_position_in_grid]]) {
+    uint width = args.heads * args.head_dim;
+    if (gid >= args.rows * width) return;
+    uint row = gid / width;
+    uint column = gid - row * width;
+    uint head = column / args.head_dim;
+    uint dim = column - head * args.head_dim;
+    output[gid] = input[(head * args.rows + row) * args.head_dim + dim];
 }
 
 kernel void h3_sub_bf16(device const ushort *left [[buffer(0)]],
@@ -4423,6 +4847,7 @@ kernel void h3_flash_attn_bf16_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;
@@ -4564,6 +4989,7 @@ kernel void h3_flash_attn_int8_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;
@@ -4683,6 +5109,7 @@ kernel void h3_sparse_attn_bf16_head_major(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
         float block_max = reductions[0];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
         float new_max = max(running_max, block_max);
         float rescale = running_max > -INFINITY ?
             exp(running_max - new_max) : 0.0f;

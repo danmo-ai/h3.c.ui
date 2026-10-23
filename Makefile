@@ -94,6 +94,21 @@ h3_dit_bench: tests/bench_dit.o $(LIB_OBJ)
 h3_flash_attn_test: tests/test_flash_attn.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
+h3_lora_runtime_test: tests/test_lora_runtime.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_attn_bench: tests/bench_attn.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_nax_attention_test: tests/test_nax_attention.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_video_vae_bench: tests/bench_video_vae.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
+h3_video_vae_mixed_test: tests/test_video_vae_mixed.o $(LIB_OBJ)
+	$(CC) -o $@ $^ $(LDLIBS)
+
 h3_dit_bench_864: tests/bench_dit_864.o $(LIB_OBJ)
 	$(CC) -o $@ $^ $(LDLIBS)
 
