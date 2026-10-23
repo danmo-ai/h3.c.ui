@@ -582,6 +582,15 @@ int h3_gpu_sdpa_bf16_head_major_output(
                      const h3_gpu_tensor *query, const h3_gpu_tensor *key,
                      const h3_gpu_tensor *value, uint32_t sequence,
                      uint32_t heads, uint32_t head_dim, float scale);
+/* Declare the next SDPA's Q/K/V as head-major [head,row,dimension], as the
+ * int8 QKV projection leaves them. */
+void h3_gpu_mark_head_major_sdpa_inputs(h3_gpu *gpu);
+/* M5 TensorOps FlashAttention over head-major Q/K/V/output (head_dim 128). */
+int h3_gpu_flash_attn_nax_bf16_head_major(
+                     h3_gpu *gpu, h3_gpu_tensor *output,
+                     const h3_gpu_tensor *query, const h3_gpu_tensor *key,
+                     const h3_gpu_tensor *value, uint32_t sequence,
+                     uint32_t heads, uint32_t head_dim, float scale);
 /* FlashAttention path for long sequences (head-major Q/K/V). Opt-in via
  * H3_FORCE_FLASH_ATTN=1 until the TensorOps Flash kernel beats MPSGraph. */
 int h3_gpu_flash_attn_bf16_head_major(

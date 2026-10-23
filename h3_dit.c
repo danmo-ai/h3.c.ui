@@ -2106,7 +2106,9 @@ static h3_dit *load_dit(const char *weight_directory,
                    turbo_lora_path : NULL);
     if (veda) {
         const char *plan_path = getenv("H3_VEDA_PLAN");
-        float keep_ratio = 0.10f;
+        /* 10 s 864x480 Turbo: 0.35 keeps ~38% of tile pairs (attention
+         * 2.2x faster than dense SDPA) with coherent frames. */
+        float keep_ratio = 0.35f;
         const char *keep_env = getenv("H3_VEDA_KEEP_RATIO");
         if (keep_env && *keep_env) {
             float parsed = strtof(keep_env, NULL);
