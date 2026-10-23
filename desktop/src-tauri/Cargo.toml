@@ -1,6 +1,6 @@
 [package]
 name = "h3-desktop"
-version = "0.2.0"
+version = "0.3.0"
 description = "H3 — Tauri shell for native Metal MiniMax-H3"
 authors = ["Danmo AI"]
 edition = "2021"
